@@ -44,6 +44,8 @@ export const api = {
   setAiSettings: (settings: AiSettings) => invoke<void>("set_ai_settings", { settings }),
   summarizeMessage: (id: number, force = false) =>
     invoke<Summary>("summarize_message", { id, force }),
+  /** 只读摘要缓存，未命中返回 null（不会触发模型推理）。 */
+  getCachedSummary: (id: number) => invoke<Summary | null>("get_cached_summary", { id }),
 };
 
 /** 统一把后端错误（字符串）转成可展示文案。 */

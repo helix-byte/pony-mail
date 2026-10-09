@@ -389,7 +389,7 @@ pub async fn summarize_message(
     }
 
     let settings = state.store.ai_settings()?;
-    let cache_key = format!("summary:{id}:{}:{}", detail.message_id, settings.model);
+    let cache_key = summary_cache_key(id, &detail.message_id, &settings.model);
 
     if !force {
         if let Some((text, model)) = state.store.get_cache(&cache_key)? {
@@ -417,6 +417,41 @@ pub async fn summarize_message(
     })
 }
 
+/// 只读摘要缓存，**绝不触发模型推理**。
+///
+/// 命中返回 `Some(Summary)`，未命中返回 `None`（前端据此落到「生成摘要」引导态）。
+/// 与 [`summarize_message`] 分开是为了表达清晰：打开邮件时只想「看看有没有现成的」，
+/// 不该意外启动一次可能耗时数十秒的本地推理。
+#[tauri::command]
+pub fn get_cached_summary(state: State<'_, AppState>, id: i64) -> AppResult<Option<Summary>> {
+    // 邮件可能已被删除 / 正文未抓取，这两种情况都视为「没有缓存」而非错误。
+    let Ok(detail) = state.store.get_message(id) else {
+        return Ok(None);
+    };
+    if !detail.header.body_loaded {
+        return Ok(None);
+    }
+
+    let settings = state.store.ai_settings()?;
+    let cache_key = summary_cache_key(id, &detail.message_id, &settings.model);
+    Ok(state
+        .store
+        .get_cache(&cache_key)?
+        .map(|(text, model)| Summary {
+            text,
+            model,
+            cached: true,
+        }))
+}
+
+/// 摘要缓存键：邮件 id + Message-ID + 模型。
+///
+/// 带上模型是因为同一封邮件在不同模型下的摘要不可互换；
+/// 带上 Message-ID 是为了覆盖「同一账号同一 UID 位置换了新邮件」的情况。
+fn summary_cache_key(id: i64, message_id: &str, model: &str) -> String {
+    format!("summary:{id}:{message_id}:{model}")
+}
+
 // ---------------------------------------------------------------------
 
 fn account_from_input(input: &AccountInput, id: &str, created_at: &str) -> Account {
@@ -432,5 +467,43 @@ fn account_from_input(input: &AccountInput, id: &str, created_at: &str) -> Accou
         smtp_tls: input.smtp_tls,
         username: input.username.trim().to_string(),
         created_at: created_at.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_cache_key_includes_id_message_id_and_model() {
+        let key = summary_cache_key(7, "AC123@example.com", "qwen3.5:9b");
+        assert_eq!(key, "summary:7:AC123@example.com:qwen3.5:9b");
+    }
+
+    #[test]
+    fn summary_cache_key_differs_by_model() {
+        // 同一封邮件换模型后必须视为不同缓存，否则会串味。
+        let a = summary_cache_key(1, "mid", "qwen3.5:9b");
+        let b = summary_cache_key(1, "mid", "qwen2.5:14b");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn summary_cache_key_differs_by_message_id() {
+        // 同一 id 位置若换了邮件（UID 复用），缓存必须失效。
+        let a = summary_cache_key(1, "old-mid", "m");
+        let b = summary_cache_key(1, "new-mid", "m");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn summary_cache_key_prefix_matches_delete_cleanup_pattern() {
+        // store::delete_message 用 `summary:{id}:%` 前缀清理，两者必须一致，
+        // 否则删邮件会留下孤儿缓存。
+        let key = summary_cache_key(42, "mid", "m");
+        assert!(
+            key.starts_with("summary:42:"),
+            "缓存键前缀必须与删除清理条件匹配：{key}"
+        );
     }
 }

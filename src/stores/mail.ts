@@ -180,10 +180,35 @@ export const useMailStore = defineStore("mail", () => {
       if (!d.header.seen) {
         await setSeen(id, true, false);
       }
+      // 正文就绪后回填已有摘要缓存：有缓存就直接展示，
+      // 不再让用户先看到「生成摘要」按钮再手动点一次。
+      //
+      // 这里刻意 await：缓存是本地 SQLite 读取，耗时极短，
+      // 但若不等它，`busy.detail` 会先落下、页面先渲染出「生成摘要」引导态，
+      // 再被缓存内容替换——形成一次可见的闪动。等它一起渲染更干净。
+      await loadCachedSummary(id);
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
       busy.detail = false;
+    }
+  }
+
+  /**
+   * 拉取摘要缓存，**不触发模型推理**（后端 `get_cached_summary` 只读 `ai_cache`）。
+   *
+   * 未命中时后端返回 `null`，这里保持 `summary` 为空即可，
+   * 界面自然落到「生成摘要」引导态，不弹任何错误提示——
+   * 用户没主动要求生成，读缓存失败不该打扰他。
+   */
+  async function loadCachedSummary(id: number) {
+    try {
+      const cached = await api.getCachedSummary(id);
+      // 竞态保护：等待期间用户可能已切走或删掉了这封邮件。
+      if (activeMessageId.value !== id) return;
+      if (cached) summary.value = cached;
+    } catch {
+      // 静默失败：缓存读取异常不该影响阅读正文这一主流程。
     }
   }
 

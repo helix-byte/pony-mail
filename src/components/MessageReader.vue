@@ -98,6 +98,22 @@ function shortAddr(list: string): string {
               <template v-if="detail.ccAddrs"> · 抄送：{{ shortAddr(detail.ccAddrs) }}</template>
               · {{ formatDateTime(detail.header.dateTs) }}
             </p>
+            <div v-if="store.tagsOf(detail.header.id).length" class="mt-1.5 flex flex-wrap gap-1.5">
+              <button
+                v-for="t in store.tagsOf(detail.header.id)"
+                :key="t.id"
+                class="inline-flex items-center gap-1 rounded-full px-2 py-[2px] text-[10.5px] font-medium transition hover:opacity-80"
+                :style="{ background: `${t.color}26`, color: t.color }"
+                title="点击移除该标签"
+                @click="store.toggleMessageTag(detail.header.id, t.id)"
+              >
+                <span class="h-1.5 w-1.5 shrink-0 rounded-full" :style="{ background: t.color }" />
+                {{ t.name }}
+                <svg class="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                  <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <!-- 操作 -->

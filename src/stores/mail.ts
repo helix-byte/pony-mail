@@ -2,7 +2,14 @@ import { defineStore } from "pinia";
 import { computed, reactive, ref } from "vue";
 
 import { api, errorText } from "../api";
-import type { Account, MessageDetail, MessageHeader, Summary } from "../api/types";
+import type {
+  Account,
+  MessageDetail,
+  MessageHeader,
+  Summary,
+  Tag,
+  TagGroup,
+} from "../api/types";
 import { formatDateTime } from "../utils/format";
 
 export type ToastKind = "info" | "ok" | "error";
@@ -37,6 +44,21 @@ export const useMailStore = defineStore("mail", () => {
   const summaryLoading = ref(false);
   const summaryError = ref("");
 
+  // ---- 标签 ----
+  const tags = ref<Tag[]>([]);
+  /** 标签组（内含成员标签 id 与去重计数）。 */
+  const groups = ref<TagGroup[]>([]);
+  /**
+   * 当前生效的筛选标签**集合**（多选，OR 语义）。
+   *
+   * 用集合而非单值，是因为侧栏既支持勾选单个标签，也支持
+   * 「选中某个组」＝选中该组全部标签，还可能组间多选。
+   * 空集合 = 看全部邮件。
+   */
+  const activeTagIds = ref<number[]>([]);
+  /** 被直接选中的组（用于侧栏高亮「这个组在筛选中」）。 */
+  const activeGroupId = ref<number | null>(null);
+
   // ---- UI ----
   const ui = reactive({
     composeOpen: false,
@@ -57,6 +79,18 @@ export const useMailStore = defineStore("mail", () => {
     () => accounts.value.find((a) => a.id === activeAccountId.value) ?? null,
   );
   const unreadCount = computed(() => messages.value.filter((m) => !m.seen).length);
+
+  /** 筛选中的标签对象（用于顶部筛选条展示）。 */
+  const activeTags = computed(() =>
+    activeTagIds.value
+      .map((id) => tags.value.find((t) => t.id === id))
+      .filter((t): t is Tag => t !== undefined),
+  );
+  /** 是否处于筛选态。 */
+  const filtering = computed(() => activeTagIds.value.length > 0);
+  const activeGroup = computed(
+    () => groups.value.find((g) => g.id === activeGroupId.value) ?? null,
+  );
 
   function toast(text: string, kind: ToastKind = "info") {
     const id = ++toastSeq;
@@ -83,6 +117,10 @@ export const useMailStore = defineStore("mail", () => {
         messages.value = [];
         detail.value = null;
         activeMessageId.value = null;
+        tags.value = [];
+        groups.value = [];
+        activeTagIds.value = [];
+        activeGroupId.value = null;
       }
       if (!activeAccountId.value && accounts.value.length > 0) {
         await selectAccount(accounts.value[0].id);
@@ -97,8 +135,14 @@ export const useMailStore = defineStore("mail", () => {
   async function selectAccount(id: string) {
     if (activeAccountId.value === id) return;
     activeAccountId.value = id;
+    // 标签与组都按账号隔离，切账号必须清掉上一个账号的筛选集合，
+    // 否则会拿 A 账号的 tagId 去筛 B 账号的邮件。
+    tags.value = [];
+    groups.value = [];
+    activeTagIds.value = [];
+    activeGroupId.value = null;
     resetReader();
-    await loadMessages();
+    await Promise.all([loadMessages(), loadTags(), loadGroups()]);
   }
 
   async function removeAccount(id: string) {
@@ -120,14 +164,327 @@ export const useMailStore = defineStore("mail", () => {
       messages.value = [];
       return;
     }
+    const accountId = activeAccountId.value;
+    // 快照筛选集合并排序成稳定 key，用于下面的竞态比对。
+    const tagIds = [...activeTagIds.value].sort((a, b) => a - b);
+    const filterKey = tagIds.join(",");
     busy.messages = true;
     try {
-      messages.value = await api.listMessages(activeAccountId.value);
+      const list = await api.listMessages(accountId, "INBOX", 200, 0, tagIds);
+      // 竞态保护：等待期间用户可能已切账号或改了筛选，旧结果不能覆盖新结果。
+      const nowKey = [...activeTagIds.value].sort((a, b) => a - b).join(",");
+      if (activeAccountId.value !== accountId || nowKey !== filterKey) return;
+      messages.value = list;
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
       busy.messages = false;
     }
+  }
+
+  /** 清空筛选，回到全部邮件。 */
+  async function clearFilter() {
+    if (activeTagIds.value.length === 0 && activeGroupId.value === null) return;
+    activeTagIds.value = [];
+    activeGroupId.value = null;
+    resetReader();
+    await loadMessages();
+  }
+
+  /**
+   * 勾选 / 取消勾选单个标签（多选，OR 语义）。
+   *
+   * 与「选中组」是两种独立操作：点在标签上只动这一个标签，
+   * 点组名才是整组。多对多下同一标签可能出现在多个组里，
+   * 因此不能靠「取消组」去推断要摘掉哪些标签。
+   */
+  async function toggleTagFilter(tagId: number) {
+    const next = activeTagIds.value.includes(tagId)
+      ? activeTagIds.value.filter((id) => id !== tagId)
+      : [...activeTagIds.value, tagId];
+    activeTagIds.value = next;
+    // 手动改标签后，「选中的组」不再精确对应筛选集合，清掉高亮避免误导。
+    activeGroupId.value = null;
+    resetReader();
+    await loadMessages();
+  }
+
+  /**
+   * 选中某个组：把该组全部标签设为筛选集合。
+   *
+   * 再次点击同一个组则取消（回到全部）。
+   */
+  async function selectGroup(groupId: number) {
+    if (activeGroupId.value === groupId) {
+      await clearFilter();
+      return;
+    }
+    const group = groups.value.find((g) => g.id === groupId);
+    if (!group) return;
+    if (group.tagIds.length === 0) {
+      toast(`标签组「${group.name}」还没有标签，先编辑组添加几个`, "info");
+      return;
+    }
+    activeGroupId.value = groupId;
+    activeTagIds.value = [...group.tagIds];
+    resetReader();
+    await loadMessages();
+  }
+
+  /** 在「选中组」状态下追加另一个组的标签（组间多选）。 */
+  async function addGroupToFilter(groupId: number) {
+    const group = groups.value.find((g) => g.id === groupId);
+    if (!group || group.tagIds.length === 0) {
+      toast("这个组还没有标签", "info");
+      return;
+    }
+    const merged = new Set([...activeTagIds.value, ...group.tagIds]);
+    activeTagIds.value = [...merged].sort((a, b) => a - b);
+    // 集合已不再等同于单一组，取消组高亮。
+    activeGroupId.value = null;
+    resetReader();
+    await loadMessages();
+  }
+
+  /** 按标签 id 集合直接筛选（供切换组、恢复状态等场景复用）。 */
+  async function filterByTags(ids: number[], groupId: number | null = null) {
+    activeTagIds.value = [...new Set(ids)].sort((a, b) => a - b);
+    activeGroupId.value = groupId;
+    resetReader();
+    await loadMessages();
+  }
+
+  // ------------------------------------------------------------------
+  // 标签
+  // ------------------------------------------------------------------
+
+  async function loadTags() {
+    if (!activeAccountId.value) {
+      tags.value = [];
+      return;
+    }
+    const accountId = activeAccountId.value;
+    try {
+      const list = await api.listTags(accountId);
+      if (activeAccountId.value !== accountId) return;
+      tags.value = list;
+      // 筛选中的标签被别处删掉了 → 从集合里摘掉，摘空了就退回「全部」。
+      const alive = new Set(list.map((t) => t.id));
+      const pruned = activeTagIds.value.filter((id) => alive.has(id));
+      if (pruned.length !== activeTagIds.value.length) {
+        activeTagIds.value = pruned;
+        void loadMessages();
+      }
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+  }
+
+  async function createTag(name: string, color: string): Promise<boolean> {
+    if (!activeAccountId.value) {
+      toast("请先添加一个邮箱账号", "info");
+      return false;
+    }
+    try {
+      await api.createTag(activeAccountId.value, name, color);
+      await loadTags();
+      toast(`已创建标签「${name.trim()}」`, "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  async function updateTag(id: number, patch: { name?: string; color?: string }) {
+    try {
+      await api.updateTag(id, patch);
+      await loadTags();
+      toast("标签已更新", "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  async function deleteTag(id: number) {
+    try {
+      await api.deleteTag(id);
+      // 本地先摘掉，避免侧栏在重新拉取前短暂闪回旧标签。
+      tags.value = tags.value.filter((t) => t.id !== id);
+      // 邮件上的标签点也要同步摘掉，否则会留下「幽灵标签」。
+      for (const m of messages.value) {
+        m.tagIds = m.tagIds.filter((tid) => tid !== id);
+      }
+      if (detail.value) {
+        detail.value.header.tagIds = detail.value.header.tagIds.filter((tid) => tid !== id);
+      }
+      // 组内成员关系在服务端已随标签删除一并清理，重新拉组以刷新成员与计数。
+      void loadGroups();
+      // 被删的标签若在筛选集合里，摘掉它；集合空了自然回到全部邮件。
+      if (activeTagIds.value.includes(id)) {
+        activeTagIds.value = activeTagIds.value.filter((tid) => tid !== id);
+        await loadMessages();
+      }
+      toast("标签已删除", "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  /** 给一封邮件切换某个标签的挂载状态。 */
+  async function toggleMessageTag(messageId: number, tagId: number) {
+    const header =
+      messages.value.find((m) => m.id === messageId) ??
+      (detail.value?.header.id === messageId ? detail.value.header : undefined);
+    const attached = header?.tagIds.includes(tagId) ?? false;
+    const next = !attached;
+
+    // 乐观更新：打标是纯本地写，回滚成本低，等往返会让点击有明显延迟。
+    applyTagLocally(messageId, tagId, next);
+    try {
+      await api.tagMessage(messageId, tagId, next);
+      await loadTags(); // 刷新标签角标
+      void loadGroups(); // 组计数也随之变化
+    } catch (e) {
+      applyTagLocally(messageId, tagId, attached); // 回滚
+      toast(errorText(e), "error");
+      return;
+    }
+
+    // 正在按该标签筛选且刚把这封邮件从它下面摘掉 → 邮件应立即从列表消失。
+    // 注意：多选 OR 语义下，只有当这封邮件不再命中集合里**任何**标签时才该消失。
+    if (activeTagIds.value.includes(tagId) && !next) {
+      const stillMatches = header ? header.tagIds.some((t) => activeTagIds.value.includes(t)) : false;
+      if (!stillMatches) await loadMessages();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 标签组
+  // ------------------------------------------------------------------
+
+  async function loadGroups() {
+    if (!activeAccountId.value) {
+      groups.value = [];
+      return;
+    }
+    const accountId = activeAccountId.value;
+    try {
+      const list = await api.listTagGroups(accountId);
+      if (activeAccountId.value !== accountId) return;
+      groups.value = list;
+      // 选中的组被删了 → 清掉高亮（筛选集合本身在 loadTags 里已被剪枝）。
+      if (activeGroupId.value !== null && !list.some((g) => g.id === activeGroupId.value)) {
+        activeGroupId.value = null;
+      }
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+  }
+
+  async function createGroup(name: string, color: string, tagIds: number[] = []) {
+    if (!activeAccountId.value) {
+      toast("请先添加一个邮箱账号", "info");
+      return false;
+    }
+    try {
+      await api.createTagGroup(activeAccountId.value, name, color, tagIds);
+      await loadGroups();
+      toast(`已创建标签组「${name.trim()}」`, "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  async function updateGroup(
+    id: number,
+    patch: { name?: string; color?: string; collapsed?: boolean; tagIds?: number[] },
+  ) {
+    try {
+      const { tagIds, ...rest } = patch;
+      if (rest.name !== undefined || rest.color !== undefined || rest.collapsed !== undefined) {
+        await api.updateTagGroup(id, rest);
+      }
+      if (tagIds) {
+        await api.setGroupTags(id, tagIds);
+      }
+      await loadGroups();
+      // 若正在筛选这个组，成员变了 → 筛选集合要跟着变。
+      if (activeGroupId.value === id && tagIds) {
+        activeTagIds.value = [...tagIds].sort((a, b) => a - b);
+        await loadMessages();
+      }
+      toast("标签组已更新", "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  async function deleteGroup(id: number) {
+    try {
+      await api.deleteTagGroup(id);
+      groups.value = groups.value.filter((g) => g.id !== id);
+      // 删组只解绑成员，标签本身仍在，因此筛选集合不受影响。
+      if (activeGroupId.value === id) {
+        activeGroupId.value = null;
+      }
+      toast("标签组已删除（标签本身保留）", "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  /** 折叠/展开组。纯 UI 状态，持久化在后端，失败仅提示不阻断。 */
+  async function toggleGroupCollapsed(id: number) {
+    const g = groups.value.find((x) => x.id === id);
+    if (!g) return;
+    const next = !g.collapsed;
+    // 先改本地让交互即时，再落库。
+    g.collapsed = next;
+    try {
+      await api.updateTagGroup(id, { collapsed: next });
+    } catch (e) {
+      g.collapsed = !next; // 回滚
+      toast(errorText(e), "error");
+    }
+  }
+
+  /** 某标签所属的组名列表（侧栏「归属」提示用）。 */
+  function groupsOfTag(tagId: number): TagGroup[] {
+    return groups.value.filter((g) => g.tagIds.includes(tagId));
+  }
+
+  function applyTagLocally(messageId: number, tagId: number, attached: boolean) {
+    for (const target of [messages.value, detail.value ? [detail.value.header] : []]) {
+      const m = target.find((h) => h.id === messageId);
+      if (!m) continue;
+      if (attached) {
+        if (!m.tagIds.includes(tagId)) m.tagIds = [...m.tagIds, tagId].sort((a, b) => a - b);
+      } else {
+        m.tagIds = m.tagIds.filter((tid) => tid !== tagId);
+      }
+    }
+  }
+
+  /** 取某封邮件当前挂载的标签对象列表（列表 / 阅读区渲染用）。 */
+  function tagsOf(messageId: number): Tag[] {
+    const header =
+      messages.value.find((m) => m.id === messageId) ??
+      (detail.value?.header.id === messageId ? detail.value.header : undefined);
+    if (!header) return [];
+    return header.tagIds
+      .map((id) => tags.value.find((t) => t.id === id))
+      .filter((t): t is Tag => t !== undefined);
   }
 
   async function sync() {
@@ -410,16 +767,40 @@ export const useMailStore = defineStore("mail", () => {
     summary,
     summaryLoading,
     summaryError,
+    tags,
+    groups,
+    activeTagIds,
+    activeGroupId,
     ui,
     busy,
     toasts,
     activeAccount,
+    activeTags,
+    activeGroup,
+    filtering,
     unreadCount,
     toast,
     loadAccounts,
     selectAccount,
     removeAccount,
     loadMessages,
+    clearFilter,
+    toggleTagFilter,
+    selectGroup,
+    addGroupToFilter,
+    filterByTags,
+    loadTags,
+    createTag,
+    updateTag,
+    deleteTag,
+    toggleMessageTag,
+    tagsOf,
+    loadGroups,
+    createGroup,
+    updateGroup,
+    deleteGroup,
+    toggleGroupCollapsed,
+    groupsOfTag,
     sync,
     resetReader,
     openMessage,

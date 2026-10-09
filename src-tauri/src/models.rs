@@ -56,6 +56,44 @@ pub struct MessageHeader {
     pub has_attachments: bool,
     pub body_loaded: bool,
     pub snippet: String,
+    /// 该邮件携带的标签。列表页直接渲染，避免逐封再查一次接口。
+    pub tag_ids: Vec<i64>,
+}
+
+/// 用户自定义标签（按账号隔离，同一账号下名称唯一）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub id: i64,
+    pub account_id: String,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i64,
+    /// 该标签下已打标的邮件数，用于侧栏角标。
+    pub message_count: i64,
+}
+
+/// 标签组：可点击筛选的标签合集，组内标签取**并集**（OR）。
+///
+/// 与标签是**多对多**关系——同一标签可同时归入多个组。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagGroup {
+    pub id: i64,
+    pub account_id: String,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i64,
+    /// 侧栏折叠状态（持久化，避免每次重启都要重新收起）。
+    pub collapsed: bool,
+    /// 组内标签 id 列表。
+    pub tag_ids: Vec<i64>,
+    /// 组内**去重后**的邮件数。不能简单把各标签计数相加——
+    /// 一封邮件若同时带组内两个标签，会被重复计入。
+    pub message_count: i64,
+    /// 组内标签自身的邮件数之和（含重复计数）。仅用于展示「标签数」以外的参考，
+    /// 与 `message_count` 的差值即重叠量。
+    pub raw_message_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

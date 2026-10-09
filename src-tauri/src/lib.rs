@@ -6,6 +6,7 @@ pub mod schema;
 /// 对集成测试可见（tests/ 下需要直接驱动删除等数据层逻辑）。
 pub mod store;
 mod ai;
+mod classify;
 mod commands;
 mod credentials;
 mod error;

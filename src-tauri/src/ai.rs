@@ -46,6 +46,12 @@ struct ChatRequest {
     /// 显式关闭后，同样的任务耗时从数十秒降到数秒，且直接产出中文摘要。
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<bool>,
+    /// 让 Ollama 在采样层面按 JSON 语法约束输出（只让结构化任务使用）。
+    ///
+    /// 实测：不加也能出合法 JSON 的模型加了更快；对不听话的模型则从机制上
+    /// 消除「前后加解释 / 代码块围栏 / 少个括号」这类格式问题。是增强而非必需。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
     options: ChatOptions,
 }
 
@@ -154,23 +160,45 @@ pub async fn summarize(
     if content.trim().is_empty() {
         return Ok("【一句话概括】无有效内容".to_string());
     }
+    run_with_recovery(client, settings, |model| {
+        request_summary(client, settings, model, &content)
+    })
+    .await
+}
 
-    match request_summary(client, settings, &settings.model, &content).await {
-        // 配置的模型不存在时，自动退回本机第一个可用模型，避免开箱即报错。
+/// 统一自愈包装：给「用某个模型发一次请求」的操作加上两类恢复。
+///
+/// 1. **模型未安装**（`ModelNotFound`）：自动换本机第一个可用模型重试一次，
+///    避免开箱即报错；
+/// 2. **runner 病态**（`ModelBusy`：复读保护 500 或 HTTP 200 空壳，两者实测同源）：
+///    卸载模型、稍候、重试一次。实测卸载后立刻重试常常仍然病态（同一输入会
+///    先成功后失败，且多模型同时驻留会显著恶化），所以留一拍让 runner 退出重载。
+///    再失败则按调用方的连续失败计数/熔断处理，避免无限自愈。
+pub(crate) async fn run_with_recovery<F, Fut>(
+    client: &reqwest::Client,
+    settings: &AiSettings,
+    call: F,
+) -> AppResult<String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = AppResult<String>>,
+{
+    match call(settings.model.clone()).await {
         Err(AppError::ModelNotFound(_)) => {
             let fallback = first_available_model(client, settings).await?;
-            request_summary(client, settings, &fallback, &content).await
+            call(fallback).await
         }
-        // 复读保护：Ollama 的 runner 会偶发进入"卡死"状态，同样输入时好时坏。
-        // 实测卸载模型（keep_alive:0）再重载即可恢复，故此处自动重试一次。
         Err(AppError::ModelBusy(_)) => {
             let _ = unload_model(client, settings, &settings.model).await;
-            match request_summary(client, settings, &settings.model, &content).await {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            match call(settings.model.clone()).await {
                 Ok(text) => Ok(text),
-                // 重载后仍然复读，说明不是 runner 状态问题。给出可执行的建议。
+                // 重载后仍然病态，说明不是短暂的 runner 状态问题。给出可执行的建议；
+                // 调用方（批量整理）会把它计入连续失败并最终熔断。
                 Err(AppError::ModelBusy(_)) => Err(AppError::Other(format!(
-                    "模型「{}」连续两次陷入重复循环。可尝试：①在「AI 设置」中改选\
-                     其他模型（如 qwen2.5:14b / deepseek-r1:7b）；②重启 Ollama 服务。",
+                    "模型「{}」连续两次陷入异常状态（重复循环或空响应）。可尝试：\
+                     ①在「AI 设置」中改选其他模型（如 qwen2.5:14b / deepseek-r1:7b）；\
+                     ②重启 Ollama 服务后重试。",
                     settings.model
                 ))),
                 other => other,
@@ -178,6 +206,64 @@ pub async fn summarize(
         }
         other => other,
     }
+}
+
+/// 结构化分类请求：`format:"json"` + `think:false` + `temperature:0`。
+///
+/// 返回模型输出的 JSON 原文（解析与容错由 `classify` 模块负责）。
+/// 与摘要共用 [`run_with_recovery`] 的自愈链路，参数差异只在本函数里。
+pub(crate) async fn chat_json(
+    client: &reqwest::Client,
+    settings: &AiSettings,
+    system: &str,
+    user: &str,
+    num_predict: i32,
+) -> AppResult<String> {
+    let url = format!("{}/api/chat", base_of(settings));
+    let body = ChatRequest {
+        model: settings.model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system",
+                content: system.to_string(),
+            },
+            ChatMessage {
+                role: "user",
+                content: user.to_string(),
+            },
+        ],
+        stream: false,
+        think: Some(false),
+        format: Some("json"),
+        options: ChatOptions {
+            // 分类同属确定性任务：温度取 0 压住小模型的格式抖动。
+            temperature: 0.0,
+            num_predict,
+        },
+    };
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        // 分类输出很短，但首次调用可能含模型加载；3 分钟足够覆盖冷启动。
+        .timeout(Duration::from_secs(180))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if let Some(mapped) = map_ollama_error(&text) {
+            return Err(mapped);
+        }
+        return Err(AppError::Other(format!(
+            "AI 服务返回 {code}：{}",
+            truncate(&text, 200)
+        )));
+    }
+
+    let parsed: ChatResponse = resp.json().await?;
+    extract_content(parsed, &settings.model)
 }
 
 /// 请求 Ollama 立即卸载指定模型（释放 runner / 显存）。
@@ -227,15 +313,18 @@ async fn first_available_model(
 }
 
 /// 用指定模型发一次摘要请求。
+///
+/// `model` 按值接收：调用方是 `run_with_recovery` 的闭包，闭包返回的 future
+/// 不能借用闭包局部变量（生命周期逃逸），按值 move 进 future 才能成立。
 async fn request_summary(
     client: &reqwest::Client,
     settings: &AiSettings,
-    model: &str,
+    model: String,
     content: &str,
 ) -> AppResult<String> {
     let url = format!("{}/api/chat", base_of(settings));
     let body = ChatRequest {
-        model: model.to_string(),
+        model: model.clone(),
         messages: vec![
             ChatMessage {
                 role: "system",
@@ -248,6 +337,7 @@ async fn request_summary(
         ],
         stream: false,
         think: Some(false),
+        format: None,
         options: ChatOptions {
             // 摘要属确定性任务，温度取 0 可显著提升小模型的格式稳定性。
             temperature: 0.0,
@@ -276,6 +366,16 @@ async fn request_summary(
     }
 
     let parsed: ChatResponse = resp.json().await?;
+    extract_content(parsed, &model)
+}
+
+/// 从 Ollama 响应中提取有效输出；空内容映射为 [`AppError::ModelBusy`]。
+///
+/// HTTP 200 空壳响应（`{"model":"","created_at":"0001-01-01T00:00:00Z",...}`，
+/// message 存在但 content 为空）与复读保护 500 实测**同源**，都是 runner 的
+/// 时间性病态（同一输入会先成功后失败），必须走「卸载 → 稍候 → 重试」的自愈
+/// 链路，绝不能把空内容当成「模型判定为空」静默消费。
+fn extract_content(parsed: ChatResponse, model: &str) -> AppResult<String> {
     if let Some(err) = parsed.error {
         if err.contains("not found") {
             return Err(AppError::ModelNotFound(model.to_string()));
@@ -292,9 +392,8 @@ async fn request_summary(
         .to_string();
 
     if text.is_empty() {
-        return Err(AppError::Other(format!(
-            "模型没有输出有效内容（模型：{model}）。请确认该模型支持文本生成，\
-             或在「AI 设置」中换用其他模型。"
+        return Err(AppError::ModelBusy(format!(
+            "Ollama 返回空响应（模型：{model}）"
         )));
     }
     Ok(text)
@@ -356,7 +455,9 @@ fn build_content(detail: &MessageDetail) -> String {
 ///
 /// 这些都会让小模型陷入复读，触发 Ollama 的
 /// `prediction aborted, token repeat limit reached`。
-fn reduce_noise(text: &str) -> String {
+///
+/// `pub(crate)`：智能整理的分类输入也要先过同一套降噪。
+pub(crate) fn reduce_noise(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut prev_line: Option<String> = None;
 
@@ -526,7 +627,7 @@ fn strip_invisible(s: &str) -> String {
     s.chars().filter(|c| !INVISIBLE.contains(c)).collect()
 }
 
-fn format_time(ts: i64) -> String {
+pub(crate) fn format_time(ts: i64) -> String {
     if ts <= 0 {
         return "未知".to_string();
     }
@@ -585,7 +686,7 @@ fn strip_html(html: &str) -> String {
         .join(" ")
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
@@ -677,6 +778,7 @@ mod tests {
             messages: vec![],
             stream: false,
             think: Some(false),
+            format: None,
             options: ChatOptions {
                 temperature: 0.2,
                 num_predict: 1024,
@@ -697,6 +799,7 @@ mod tests {
             messages: vec![],
             stream: false,
             think: None,
+            format: None,
             options: ChatOptions {
                 temperature: 0.2,
                 num_predict: 64,
@@ -704,6 +807,66 @@ mod tests {
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("think"), "None 时不应输出该字段：{json}");
+    }
+
+    /// 分类请求必须带 `"format":"json"`（语法层约束模型输出合法 JSON）。
+    #[test]
+    fn request_body_sets_json_format_when_requested() {
+        let body = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: false,
+            think: Some(false),
+            format: Some("json"),
+            options: ChatOptions {
+                temperature: 0.0,
+                num_predict: 256,
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""format":"json""#), "分类请求应约束 JSON：{json}");
+    }
+
+    /// 摘要请求不带 `format`，保持原有纯文本输出契约。
+    #[test]
+    fn request_body_omits_format_when_none() {
+        let body = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: false,
+            think: Some(false),
+            format: None,
+            options: ChatOptions {
+                temperature: 0.0,
+                num_predict: 512,
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("format"), "未指定时不应输出该字段：{json}");
+    }
+
+    /// 回归测试（关键）：HTTP 200 空壳响应必须映射为 `ModelBusy` 走自愈，
+    /// 绝不能静默当成「模型判定为空」。
+    ///
+    /// 空壳原文取自本机实测（与复读 500 同源的 runner 病态，curl 直连亦可复现）。
+    #[test]
+    fn empty_shell_response_maps_to_model_busy() {
+        let r = parse(
+            r#"{"model":"","created_at":"0001-01-01T00:00:00Z","message":{"role":"","content":""},"done":false}"#,
+        );
+        let err = extract_content(r, "qwen3.5:9b").expect_err("空壳应报错");
+        assert!(
+            matches!(err, AppError::ModelBusy(_)),
+            "空壳应分类为 ModelBusy 以便自动重试，实际：{err:?}"
+        );
+    }
+
+    /// 模型不存在的响应经 extract_content 应分类为 ModelNotFound（走模型回退）。
+    #[test]
+    fn extract_content_maps_model_not_found() {
+        let r = parse(r#"{"error":"model 'qwen2.5:7b' not found"}"#);
+        let err = extract_content(r, "qwen2.5:7b").expect_err("不应成功");
+        assert!(matches!(err, AppError::ModelNotFound(_)), "应分类为 ModelNotFound：{err:?}");
     }
 
     /// 回归测试：Ollama 的复读保护必须被识别为「可自愈」类错误。

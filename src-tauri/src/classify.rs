@@ -24,7 +24,11 @@ pub const DEFAULT_CONFIDENCE: f64 = 0.6;
 /// 组内候选注入 prompt 的上限，超出省略（防标签多时 prompt 爆长）。
 pub const CANDIDATE_HINT_LIMIT: usize = 30;
 /// 正文节选长度上限（字符）。
-pub const BODY_EXCERPT_LIMIT: usize = 1200;
+///
+/// 实测（2026-10-09，Qwen2.5-7B / qwen3.5:9b）：失败集中在长 prompt 的邮件上
+/// （>1000 字 3 例 2 败；<700 字 3 例 3 成），短输入明显更稳。800 字对分类判断
+/// （谁发的 / 什么类型 / 是否营销）已足够——保留方向性证据下的保守取值。
+pub const BODY_EXCERPT_LIMIT: usize = 800;
 /// snippet 长度上限（正文未加载时的降级输入）。
 pub const SNIPPET_LIMIT: usize = 400;
 /// 发件人快速通道的历史样本下限。
@@ -32,7 +36,7 @@ pub const SENDER_SKIP_MIN_SAMPLES: i64 = 3;
 
 /// 新标签名长度范围（字符数）。
 pub const NEW_NAME_MIN_CHARS: usize = 2;
-pub const NEW_NAME_MAX_CHARS: usize = 16;
+pub const NEW_NAME_MAX_CHARS: usize = 24;
 /// 新标签名禁用字符（对照 Hony 已验证的常量）。
 const NEW_NAME_FORBIDDEN: [char; 8] = ['@', '\n', '\r', ':', '：', '/', '\\', '|'];
 
@@ -141,7 +145,7 @@ pub fn build_system_prompt(groups: &[DimensionGroup]) -> String {
          - 必须输出且只输出「{keys}」这些键，以及 confidence，一个不多、一个不少。\n\
          - 不允许创建新值的维度：只能从列表中原样选择或 null，不要自造新标签。\n\
          - 允许创建的维度：优先复用已有标签；只有邮件明显来自某个产品/服务/机构品牌时，\
-         才创建 2-16 个字的新名称，不含 @、斜杠、冒号、换行等符号；同一品牌始终使用同一名称。\n\
+         才创建 2-24 个字的新名称，不含 @、斜杠、冒号、换行等符号；同一品牌始终使用同一名称。\n\
          - 无法判断或不确定时值必须为 null，不要猜测，不要用 false、空字符串或「无」之类的占位。\n\
          - confidence 是 0 到 1 的小数，表示整体判断的把握。\n\
          - 全部使用简体中文；品牌名保留常用原名。",
@@ -176,7 +180,7 @@ fn format_dimension(g: &DimensionGroup) -> String {
         GroupAiMode::Create if names.is_empty() => {
             format!(
                 "- {}：若邮件明显来自某个产品/服务/机构品牌（如 Steam、Microsoft），\
-                 可用其通用短名（2-16 个字，不含 @ 斜杠冒号换行等符号）作为新标签输出；\
+                 可用其通用短名（2-24 个字，不含 @ 斜杠冒号换行等符号）作为新标签输出；\
                  个人邮件、无法判断时输出 null。",
                 g.name
             )
@@ -184,7 +188,7 @@ fn format_dimension(g: &DimensionGroup) -> String {
         GroupAiMode::Create => {
             format!(
                 "- {}：优先复用已有标签：{}{omitted}；若邮件明显来自某个产品/服务/机构品牌，\
-                 可用其通用短名（2-16 个字，不含 @ 斜杠冒号换行等符号）作为新标签输出；\
+                 可用其通用短名（2-24 个字，不含 @ 斜杠冒号换行等符号）作为新标签输出；\
                  个人邮件、无法判断时输出 null。",
                 g.name,
                 names.join("、"),
@@ -273,18 +277,39 @@ pub fn parse_classify(raw: &str, groups: &[DimensionGroup]) -> Option<ParsedClas
     }
 
     let confidence = parse_confidence(obj);
-    let picks = groups
-        .iter()
-        .zip(&matched)
-        .map(|(g, key)| {
-            if confidence < CONFIDENCE_FLOOR {
-                // 低置信：全部不指派（保守），但仍算「已整理」避免无限重试。
-                return None;
-            }
-            key.and_then(|k| obj.get(k)).and_then(|v| pick_from_value(v, g))
-        })
-        .collect();
+    if confidence < CONFIDENCE_FLOOR {
+        // 低置信：全部不指派（保守），但仍算「已整理」避免无限重试。
+        return Some(ParsedClassify {
+            picks: groups.iter().map(|_| None).collect(),
+        });
+    }
 
+    let mut picks = Vec::with_capacity(groups.len());
+    let mut any_hit = false;
+    let mut any_rejected = false;
+    for (g, key) in groups.iter().zip(&matched) {
+        let outcome = key
+            .and_then(|k| obj.get(k))
+            .map_or(ValueOutcome::Skip, |v| pick_from_value(v, g));
+        match outcome {
+            ValueOutcome::Hit(pick) => {
+                any_hit = true;
+                picks.push(Some(pick));
+            }
+            ValueOutcome::Skip => picks.push(None),
+            ValueOutcome::Rejected => {
+                any_rejected = true;
+                picks.push(None);
+            }
+        }
+    }
+    // 模型交了一份「有值但全被拒」的答卷（实测形态：把 user prompt 的头部字段
+    // 抄成键值、幻觉出未知标签、复读污染）：这次判定无效——判失败让它下次重试，
+    // 而不是消费掉这封邮件唯一的重试机会（写标记后就永久跳过了）。
+    // 注意与「明确输出 null」（Skip）的区别：那是有效的「不指派」判定。
+    if any_rejected && !any_hit {
+        return None;
+    }
     Some(ParsedClassify { picks })
 }
 
@@ -333,19 +358,37 @@ fn match_key<'a, I: Iterator<Item = &'a str>>(keys: I, group_name: &str) -> Opti
     best.map(|(k, _)| k)
 }
 
+/// 单个键值的三态判定结果。
+enum ValueOutcome {
+    /// 无值 / null / 占位词——「不指派」的**有效**判定（模型明确没选）。
+    Skip,
+    /// 有值但被拒（未知标签、非法新名、类型不对）——模型给了废答案。
+    Rejected,
+    Hit(Pick),
+}
+
 /// 单个键值的指派判定。
-fn pick_from_value(value: &Value, group: &DimensionGroup) -> Option<Pick> {
-    let s = value.as_str()?; // 非字符串（布尔 / 数字 / 数组 / 对象）一律不指派
-    let cleaned = clean_value(s)?;
+fn pick_from_value(value: &Value, group: &DimensionGroup) -> ValueOutcome {
+    // JSON null = 模型明确的「不指派」（提示词规则要求不确定时输出 null）。
+    if value.is_null() {
+        return ValueOutcome::Skip;
+    }
+    // 其他非字符串（布尔 / 数字 / 数组 / 对象）出现在值位 = 废答案。
+    let Some(s) = value.as_str() else {
+        return ValueOutcome::Rejected;
+    };
+    let Some(cleaned) = clean_value(s) else {
+        return ValueOutcome::Skip;
+    };
     let cleaned = strip_group_prefix(&cleaned, &group.name);
 
     if let Some((id, _)) = match_name(&cleaned, &group.candidates) {
-        return Some(Pick::Existing(id));
+        return ValueOutcome::Hit(Pick::Existing(id));
     }
     if group.mode == GroupAiMode::Create && valid_new_label_name(&cleaned) {
-        return Some(Pick::New(cleaned));
+        return ValueOutcome::Hit(Pick::New(cleaned));
     }
-    None
+    ValueOutcome::Rejected
 }
 
 /// 值清洗：去首尾空白与包裹引号；空值 / 占位词（「无 / null / 不确定」等）→ `None`。
@@ -438,7 +481,7 @@ fn parse_confidence(obj: &serde_json::Map<String, Value>) -> f64 {
 // 新标签校验、配色与发件人统计
 // ---------------------------------------------------------------------
 
-/// 新标签名校验：2~16 字，且不含 `@` / 换行 / 冒号 / 斜杠等符号。
+/// 新标签名校验：2~24 字，且不含 `@` / 换行 / 冒号 / 斜杠等符号。
 pub fn valid_new_label_name(name: &str) -> bool {
     let t = name.trim();
     let len = t.chars().count();
@@ -565,7 +608,7 @@ mod tests {
         assert!(parse_classify("{}", &groups()).is_none());
     }
 
-    /// 实测样例：null 位置填了 JSON 布尔 → 该维度不指派（但不是整封失败）。
+    /// 实测样例：null 位置填了 JSON 布尔 → 该维度作废（但另一维度有命中，整体仍成功）。
     #[test]
     fn boolean_value_not_assigned() {
         let raw = r#"{"发件方":"NVIDA","内容":false,"confidence":0.9}"#;
@@ -574,12 +617,38 @@ mod tests {
         assert_eq!(parsed.picks[1], None, "布尔值不得指派");
     }
 
-    /// 实测样例：select 维度被臆造值（候选仅「促销」却答「新登录」）→ 拒绝。
+    /// 实测样例：select 维度被臆造值（候选仅「促销」却答「新登录」）→ 拒绝该维度。
     #[test]
     fn unknown_value_rejected_in_select() {
         let raw = r#"{"发件方":"NVIDA","内容":"新登录","confidence":0.9}"#;
         let parsed = parse_classify(raw, &groups()).unwrap();
         assert_eq!(parsed.picks[1], None, "select 维度不得臆造");
+    }
+
+    /// 实测样例（2026-10-09 真机）：模型把 user prompt 的头部字段抄成键值
+    /// （`"发件人":"Maxon <...@...>"`、复读污染串等）→ 有值但全被拒 →
+    /// 判整封失败（不写标记、下次重试），而不是消费掉这封邮件的重试机会。
+    #[test]
+    fn all_rejected_values_fail_whole() {
+        let raw = r#"{"发件方":"Maxon <info@news.maxon.net>","内容":"我们正在更新最终用户许可协议 (EULA)。","confidence":0.9}"#;
+        assert!(parse_classify(raw, &groups()).is_none(), "全被拒应判失败");
+    }
+
+    /// 明确输出 null（Skip）是有效的「不指派」判定——照常记「已整理」。
+    #[test]
+    fn all_null_picks_still_succeed() {
+        let raw = r#"{"发件方":null,"内容":null,"confidence":0.9}"#;
+        let parsed = parse_classify(raw, &groups()).expect("全 null 应成功");
+        assert!(parsed.picks.iter().all(Option::is_none));
+    }
+
+    /// 部分命中 + 部分被拒：命中的照常落地，被拒的组不指派。
+    #[test]
+    fn one_hit_with_rejected_sibling_succeeds() {
+        let raw = r#"{"发件方":"NVIDA","内容":"一串复读污染 N, V, I...","confidence":0.9}"#;
+        let parsed = parse_classify(raw, &groups()).expect("有命中即成功");
+        assert_eq!(parsed.picks[0], Some(Pick::Existing(10)));
+        assert_eq!(parsed.picks[1], None);
     }
 
     /// create 维度上合法的品牌新名 → Pick::New。
@@ -684,7 +753,7 @@ mod tests {
         assert!(valid_new_label_name("NVIDIA"));
         assert!(!valid_new_label_name("a@b.com"), "含 @ 应拒绝");
         assert!(!valid_new_label_name("甲"), "单字应拒绝");
-        assert!(!valid_new_label_name(&"很".repeat(17)), "超 16 字应拒绝");
+        assert!(!valid_new_label_name(&"很".repeat(25)), "超 24 字应拒绝");
         assert!(!valid_new_label_name("a/b"), "含斜杠应拒绝");
         assert!(!valid_new_label_name("a：b"), "含冒号应拒绝");
         assert!(!valid_new_label_name(" a\nb "), "含换行应拒绝");

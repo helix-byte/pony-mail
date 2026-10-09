@@ -190,7 +190,12 @@ where
         }
         Err(AppError::ModelBusy(_)) => {
             let _ = unload_model(client, settings, &settings.model).await;
-            tokio::time::sleep(Duration::from_millis(1500)).await;
+            // 实测（2026-10-09，本机 0.40.2 + qwen3.5:9b）：
+            // - runner 进入病态后不会自发恢复——不卸载的话后续请求持续空壳（跨分钟级）；
+            // - 卸载后立即/1.5s 重试仍空壳（runner 尚未退干净），冷却 5s 后重载即恢复
+            //   （恢复后多个请求连续健康）。
+            // 因此等待取 5s：短暂延迟换自愈成功率；仍失败则由调用方计连续失败并熔断。
+            tokio::time::sleep(Duration::from_millis(5000)).await;
             match call(settings.model.clone()).await {
                 Ok(text) => Ok(text),
                 // 重载后仍然病态，说明不是短暂的 runner 状态问题。给出可执行的建议；

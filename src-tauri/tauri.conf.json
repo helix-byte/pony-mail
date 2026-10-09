@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "Pony Mail",
-        "width": 1320,
+        "width": 1461,
         "height": 860,
-        "minWidth": 1000,
+        "minWidth": 1461,
         "minHeight": 640,
         "center": true
       }

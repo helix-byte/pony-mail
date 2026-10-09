@@ -14,6 +14,8 @@ const store = useMailStore();
 
 onMounted(() => {
   void store.loadAccounts();
+  // AI 设置（含「同步后自动整理」开关）在启动时并入缓存。
+  void store.loadAiSettings();
 });
 </script>
 

@@ -53,6 +53,8 @@ export interface Tag {
   sortOrder: number;
   /** 已打标邮件数，用于侧栏角标。 */
   messageCount: number;
+  /** 创建者："user"（默认）或 "ai"（智能整理创建）。 */
+  createdBy: string;
 }
 
 /**
@@ -74,6 +76,11 @@ export interface TagGroup {
   messageCount: number;
   /** 组内各标签邮件数之和（含重复计数），与 messageCount 的差值即重叠量。 */
   rawMessageCount: number;
+  /**
+   * AI 整理维度模式："off"（默认，不参与）/ "select"（从组内现有标签选一个）
+   * / "create"（可从组内选，也可创建新标签并自动入组）。
+   */
+  aiMode: string;
 }
 
 export interface AttachmentMeta {
@@ -130,7 +137,28 @@ export interface AiStatus {
 export interface AiSettings {
   baseUrl: string;
   model: string;
+  /** 同步完成后自动整理新邮件（缺省视为开启）。 */
+  autoClassify: boolean;
 }
+
+/** 批量整理的事件流（与 Rust 侧 `ClassifyEvent` 的 serde 形态一一对应）。 */
+export type ClassifyEvent =
+  | { event: "start"; data: { total: number } }
+  | {
+      event: "item";
+      data: { messageId: number; tagIds: number[]; skipped: boolean; error: string | null };
+    }
+  | {
+      event: "done";
+      data: {
+        classified: number;
+        failed: number;
+        skipped: number;
+        remaining: number;
+        cancelled: boolean;
+      };
+    }
+  | { event: "error"; data: { message: string } };
 
 export interface SendPayload {
   accountId: string;

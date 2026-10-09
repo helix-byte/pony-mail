@@ -74,12 +74,33 @@ const groupDraftName = ref("");
 const groupDraftColor = ref(GROUP_PALETTE[0]);
 /** 编辑器里勾选的成员标签 id。 */
 const groupDraftTagIds = ref<number[]>([]);
+/** 编辑器的「AI 整理」模式："off" / "select" / "create"。 */
+const groupDraftAiMode = ref("off");
+
+/** 「AI 整理」三态（值对应后端 `tag_groups.ai_mode`）。 */
+const AI_MODE_OPTIONS: { value: string; label: string }[] = [
+  { value: "off", label: "不参与" },
+  { value: "select", label: "仅选择" },
+  { value: "create", label: "可创建" },
+];
+const AI_MODE_HINTS: Record<string, string> = {
+  off: "智能整理不会读写这个组。",
+  select: "整理时只能从组内现有标签中选一个。",
+  create: "优先从组内选择；识别到新品牌时会自动创建标签并加入本组。",
+};
+
+/** 正在编辑的标签是否为 AI 创建（编辑器里给一行说明）。 */
+const editingTagCreatedByAi = computed(() => {
+  if (editingId.value === null) return false;
+  return store.tags.find((t) => t.id === editingId.value)?.createdBy === "ai";
+});
 
 function openCreateGroup() {
   editingGroupId.value = null;
   groupDraftName.value = "";
   groupDraftColor.value = GROUP_PALETTE[store.groups.length % GROUP_PALETTE.length];
   groupDraftTagIds.value = [];
+  groupDraftAiMode.value = "off";
   groupEditorOpen.value = true;
 }
 
@@ -90,6 +111,7 @@ function openEditGroup(id: number) {
   groupDraftName.value = g.name;
   groupDraftColor.value = g.color;
   groupDraftTagIds.value = [...g.tagIds];
+  groupDraftAiMode.value = g.aiMode;
   groupEditorOpen.value = true;
 }
 
@@ -110,11 +132,12 @@ async function submitGroupEditor() {
   const tagIds = [...groupDraftTagIds.value];
   const ok =
     editingGroupId.value === null
-      ? await store.createGroup(name, groupDraftColor.value, tagIds)
+      ? await store.createGroup(name, groupDraftColor.value, tagIds, groupDraftAiMode.value)
       : await store.updateGroup(editingGroupId.value, {
           name,
           color: groupDraftColor.value,
           tagIds,
+          aiMode: groupDraftAiMode.value,
         });
   if (ok) closeGroupEditor();
 }
@@ -309,6 +332,17 @@ const ungroupedTags = computed(() => {
                 >
                   {{ g.name }}
                 </span>
+                <span
+                  v-if="g.aiMode !== 'off'"
+                  class="shrink-0 rounded bg-indigo-500/15 px-1 py-px text-[9px] font-semibold text-indigo-300"
+                  :title="
+                    g.aiMode === 'create'
+                      ? 'AI 整理维度：从组内选择，也可自动创建新标签'
+                      : 'AI 整理维度：只从组内现有标签中选择'
+                  "
+                >
+                  AI
+                </span>
                 <span class="shrink-0 text-[10px] text-zinc-600">{{ g.tagIds.length }}</span>
               </button>
 
@@ -492,6 +526,13 @@ const ungroupedTags = computed(() => {
             />
           </label>
 
+          <p
+            v-if="editingTagCreatedByAi"
+            class="rounded-lg bg-indigo-500/10 px-3 py-2 text-[11px] leading-relaxed text-indigo-300/90"
+          >
+            此标签由智能整理创建；你可以直接改名、改色或删除它。
+          </p>
+
           <div>
             <span class="mb-1.5 block text-[12px] text-zinc-400">颜色</span>
             <div class="flex flex-wrap gap-2">
@@ -571,6 +612,31 @@ const ungroupedTags = computed(() => {
                 @click="groupDraftColor = c"
               />
             </div>
+          </div>
+
+          <div>
+            <div class="mb-1.5 flex items-baseline gap-2">
+              <span class="text-[12px] text-zinc-400">AI 整理</span>
+              <span class="text-[10.5px] text-zinc-600">开启后此组作为一个整理维度</span>
+            </div>
+            <div class="flex rounded-lg border border-line bg-panel-2 p-0.5">
+              <button
+                v-for="opt in AI_MODE_OPTIONS"
+                :key="opt.value"
+                class="flex-1 rounded-md px-2 py-1.5 text-[11.5px] transition"
+                :class="
+                  groupDraftAiMode === opt.value
+                    ? 'bg-accent/20 font-medium text-indigo-300'
+                    : 'text-zinc-500 hover:text-zinc-300'
+                "
+                @click="groupDraftAiMode = opt.value"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
+            <p class="mt-1.5 text-[10.5px] leading-relaxed text-zinc-600">
+              {{ AI_MODE_HINTS[groupDraftAiMode] }}
+            </p>
           </div>
 
           <div>

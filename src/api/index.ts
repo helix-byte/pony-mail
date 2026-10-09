@@ -1,10 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 import type {
   Account,
   AccountInput,
   AiSettings,
   AiStatus,
+  ClassifyEvent,
   DeleteReport,
   MessageDetail,
   MessageHeader,
@@ -61,12 +62,16 @@ export const api = {
   listTagGroups: (accountId: string) => invoke<TagGroup[]>("list_tag_groups", { accountId }),
   createTagGroup: (accountId: string, name: string, color: string, tagIds: number[] = []) =>
     invoke<TagGroup>("create_tag_group", { accountId, name, color, tagIds }),
-  updateTagGroup: (id: number, patch: { name?: string; color?: string; collapsed?: boolean }) =>
+  updateTagGroup: (
+    id: number,
+    patch: { name?: string; color?: string; collapsed?: boolean; aiMode?: string },
+  ) =>
     invoke<void>("update_tag_group", {
       id,
       name: patch.name ?? null,
       color: patch.color ?? null,
       collapsed: patch.collapsed ?? null,
+      aiMode: patch.aiMode ?? null,
     }),
   deleteTagGroup: (id: number) => invoke<void>("delete_tag_group", { id }),
   /** 整组覆盖式设置成员标签。 */
@@ -86,6 +91,14 @@ export const api = {
     invoke<Summary>("summarize_message", { id, force }),
   /** 只读摘要缓存，未命中返回 null（不会触发模型推理）。 */
   getCachedSummary: (id: number) => invoke<Summary | null>("get_cached_summary", { id }),
+  /**
+   * 批量智能整理：逐封推送进度事件（Channel 点对点流）。
+   * 调用方自行处理 onmessage 的 start / item / done / error。
+   */
+  classifyMessages: (accountId: string, onEvent: Channel<ClassifyEvent>) =>
+    invoke<void>("classify_messages", { accountId, onEvent }),
+  /** 请求中止正在进行的整理（在消息边界生效）。 */
+  cancelClassify: (accountId: string) => invoke<void>("cancel_classify", { accountId }),
 };
 
 /** 统一把后端错误（字符串）转成可展示文案。 */

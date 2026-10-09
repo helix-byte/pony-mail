@@ -1,9 +1,12 @@
+import { Channel } from "@tauri-apps/api/core";
 import { defineStore } from "pinia";
 import { computed, reactive, ref } from "vue";
 
 import { api, errorText } from "../api";
 import type {
   Account,
+  AiSettings,
+  ClassifyEvent,
   MessageDetail,
   MessageHeader,
   Summary,
@@ -43,6 +46,15 @@ export const useMailStore = defineStore("mail", () => {
   const summary = ref<Summary | null>(null);
   const summaryLoading = ref(false);
   const summaryError = ref("");
+
+  // ---- 智能整理 ----
+  /** AI 设置缓存（含「同步后自动整理」开关，缺省视为开启）。 */
+  const aiSettings = ref<AiSettings | null>(null);
+  /** 是否正在批量整理（账户级互斥，运行期间禁用入口）。 */
+  const classifying = ref(false);
+  /** 整理进度（逐封推进；null 表示未在整理）。 */
+  const classifyProgress = ref<{ done: number; total: number } | null>(null);
+  const autoClassify = computed(() => aiSettings.value?.autoClassify ?? true);
 
   // ---- 标签 ----
   const tags = ref<Tag[]>([]);
@@ -386,13 +398,22 @@ export const useMailStore = defineStore("mail", () => {
     }
   }
 
-  async function createGroup(name: string, color: string, tagIds: number[] = []) {
+  async function createGroup(
+    name: string,
+    color: string,
+    tagIds: number[] = [],
+    aiMode = "off",
+  ) {
     if (!activeAccountId.value) {
       toast("请先添加一个邮箱账号", "info");
       return false;
     }
     try {
-      await api.createTagGroup(activeAccountId.value, name, color, tagIds);
+      const created = await api.createTagGroup(activeAccountId.value, name, color, tagIds);
+      // create_tag_group 不带 ai_mode，需要时补一次更新。
+      if (aiMode !== "off") {
+        await api.updateTagGroup(created.id, { aiMode });
+      }
       await loadGroups();
       toast(`已创建标签组「${name.trim()}」`, "ok");
       return true;
@@ -404,11 +425,22 @@ export const useMailStore = defineStore("mail", () => {
 
   async function updateGroup(
     id: number,
-    patch: { name?: string; color?: string; collapsed?: boolean; tagIds?: number[] },
+    patch: {
+      name?: string;
+      color?: string;
+      collapsed?: boolean;
+      tagIds?: number[];
+      aiMode?: string;
+    },
   ) {
     try {
       const { tagIds, ...rest } = patch;
-      if (rest.name !== undefined || rest.color !== undefined || rest.collapsed !== undefined) {
+      if (
+        rest.name !== undefined ||
+        rest.color !== undefined ||
+        rest.collapsed !== undefined ||
+        rest.aiMode !== undefined
+      ) {
         await api.updateTagGroup(id, rest);
       }
       if (tagIds) {
@@ -506,6 +538,8 @@ export const useMailStore = defineStore("mail", () => {
         "ok",
       );
       await loadMessages();
+      // 同步完成后自动整理新邮件（默认开启，可在「AI 设置」中关闭）。
+      if (autoClassify.value) void classifyAll();
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
@@ -683,6 +717,107 @@ export const useMailStore = defineStore("mail", () => {
   }
 
   // ------------------------------------------------------------------
+  // 智能整理
+  // ------------------------------------------------------------------
+
+  /** 拉取 AI 设置（自动整理开关等）。失败静默——设置读取异常不该打断主流程。 */
+  async function loadAiSettings() {
+    try {
+      aiSettings.value = await api.getAiSettings();
+    } catch {
+      // 保持 null，按默认值（开启自动整理）处理。
+    }
+  }
+
+  /** 把某封邮件的标签集合就地更新（整理事件回推用，避免整表重拉）。 */
+  function setTagsLocally(messageId: number, tagIds: number[]) {
+    const sorted = [...tagIds].sort((a, b) => a - b);
+    const m = messages.value.find((x) => x.id === messageId);
+    if (m) m.tagIds = sorted;
+    if (detail.value && detail.value.header.id === messageId) {
+      detail.value.header.tagIds = sorted;
+    }
+  }
+
+  /**
+   * 发起批量智能整理（手动按钮与「同步后自动整理」共用）。
+   *
+   * 逐封进度经 Tauri Channel 点对点推送；运行期间 `classifying` 为真，
+   * 入口按钮变为「整理中 x/y（点击停止）」。
+   */
+  async function classifyAll() {
+    const accountId = activeAccountId.value;
+    if (!accountId || classifying.value) return;
+    classifying.value = true;
+    classifyProgress.value = null;
+
+    const channel = new Channel<ClassifyEvent>();
+    channel.onmessage = (msg) => {
+      if (msg.event === "start") {
+        if (msg.data.total > 0) {
+          classifyProgress.value = { done: 0, total: msg.data.total };
+        } else {
+          classifyProgress.value = null;
+          toast("没有待整理的邮件", "info");
+        }
+      } else if (msg.event === "item") {
+        if (classifyProgress.value) classifyProgress.value.done += 1;
+        // 成功（含快速通道）就地更新标签；失败项保持原样。
+        if (!msg.data.error) {
+          setTagsLocally(msg.data.messageId, msg.data.tagIds);
+          // 出现了未知标签 id（AI 刚创建的新标签）→ 刷新标签库才能渲染出来。
+          if (msg.data.tagIds.some((id) => !tags.value.some((t) => t.id === id))) {
+            void loadTags();
+          }
+        }
+      } else if (msg.event === "done") {
+        classifyProgress.value = null;
+        const { cancelled, classified, failed, skipped: byFastlane, remaining } = msg.data;
+        const lane = byFastlane > 0 ? `（快速通道 ${byFastlane} 封）` : "";
+        if (cancelled) {
+          toast(`整理已停止：已整理 ${classified} 封`, "info");
+        } else if (failed > 0) {
+          toast(
+            `整理完成：成功 ${classified} 封${lane}，失败 ${failed} 封，剩余 ${remaining} 封`,
+            "info",
+          );
+        } else {
+          toast(
+            `整理完成：共 ${classified} 封${lane}${remaining > 0 ? `，剩余 ${remaining} 封` : ""}`,
+            "ok",
+          );
+        }
+        // 标签角标 / 组计数 / 筛选中的列表成员都可能变化。
+        void loadTags();
+        void loadGroups();
+        if (filtering.value) void loadMessages();
+      } else if (msg.event === "error") {
+        classifyProgress.value = null;
+        toast(msg.data.message, "error");
+      }
+    };
+
+    try {
+      await api.classifyMessages(accountId, channel);
+    } catch (e) {
+      toast(errorText(e), "error");
+    } finally {
+      classifying.value = false;
+      classifyProgress.value = null;
+    }
+  }
+
+  /** 请求中止整理（在消息边界生效；已整理的结果保留）。 */
+  async function cancelClassify() {
+    if (!activeAccountId.value || !classifying.value) return;
+    try {
+      await api.cancelClassify(activeAccountId.value);
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+  }
+
+  // ------------------------------------------------------------------
   // 写信
   // ------------------------------------------------------------------
 
@@ -764,9 +899,18 @@ export const useMailStore = defineStore("mail", () => {
     activeMessageId,
     detail,
     lastSync,
+    // ---- AI ----
     summary,
     summaryLoading,
     summaryError,
+    aiSettings,
+    classifying,
+    classifyProgress,
+    autoClassify,
+    loadAiSettings,
+    classifyAll,
+    cancelClassify,
+    setTagsLocally,
     tags,
     groups,
     activeTagIds,

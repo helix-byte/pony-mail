@@ -34,7 +34,9 @@ lettre = { version = "0.11", default-features = false, features = [
     "builder",
     "hostname",
 ] }
-mail-parser = "0.11"
+# full_encoding 启用 encoding_rs，否则 GBK/Big5/EUC 等非 UTF-8 正文会退化成
+# from_utf8_lossy，产生不可逆的 U+FFFD 乱码。
+mail-parser = { version = "0.11", features = ["full_encoding"] }
 
 # ---- 本地存储与凭据 ----
 rusqlite = { version = "0.40", features = ["bundled"] }

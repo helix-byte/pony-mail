@@ -111,3 +111,55 @@ fn plain_or_empty(text: &str) -> String {
         plain_to_html(text)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GBK 编码的正文必须被正确解码。
+    ///
+    /// 回归防线：`mail-parser` 的 `default = []`，多字节解码器全部由
+    /// `full_encoding` feature 门控。一旦该 feature 被移除，GBK 字节会退化
+    /// 成 `from_utf8_lossy`，中文变成不可逆的 U+FFFD（'我' → "��"）。
+    #[test]
+    fn decodes_gbk_body_without_replacement_chars() {
+        // "我" 的 GBK 编码是 CE D2，"们" 是 C3 C7
+        let gbk_body: Vec<u8> = vec![0xCE, 0xD2, 0xC3, 0xC7];
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"From: =?GBK?B?x7CzzM7e08c=?= <hr@51job.com>\r\n");
+        raw.extend_from_slice(b"To: me@example.com\r\n");
+        raw.extend_from_slice(b"Subject: =?GBK?B?x7CzzM7e08c=?=\r\n");
+        raw.extend_from_slice(b"MIME-Version: 1.0\r\n");
+        raw.extend_from_slice(b"Content-Type: text/plain; charset=\"GBK\"\r\n");
+        raw.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(&gbk_body);
+
+        let mail = parse(&raw, 1, false, false, true).expect("应能解析");
+
+        assert_eq!(mail.body_text, "我们", "GBK 正文应被正确解码");
+        assert!(
+            !mail.body_text.contains('\u{FFFD}'),
+            "不应出现 U+FFFD 替换字符，说明 full_encoding 丢失"
+        );
+        // 发件人姓名 "前程无忧" 的 GBK 编码
+        assert_eq!(mail.from_name, "前程无忧", "GBK 编码词应被正确解码");
+    }
+
+    /// UTF-8 正文不应受编码改动影响。
+    #[test]
+    fn still_decodes_utf8_body() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"From: a@example.com\r\n");
+        raw.extend_from_slice(b"Subject: hello\r\n");
+        raw.extend_from_slice(b"MIME-Version: 1.0\r\n");
+        raw.extend_from_slice(b"Content-Type: text/plain; charset=\"utf-8\"\r\n");
+        raw.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n");
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice("你好，世界".as_bytes());
+
+        let mail = parse(&raw, 2, false, false, true).expect("应能解析");
+        assert_eq!(mail.body_text, "你好，世界");
+    }
+}

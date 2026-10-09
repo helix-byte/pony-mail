@@ -12,6 +12,7 @@ import type {
   Summary,
   SyncReport,
   Tag,
+  TagGroup,
   TestReport,
 } from "./types";
 
@@ -28,14 +29,17 @@ export const api = {
   // ---- 同步与读取 ----
   syncInbox: (accountId: string, folder = "INBOX", limit = 40) =>
     invoke<SyncReport>("sync_inbox", { accountId, folder, limit }),
-  /** 列邮件；传 `tagId` 时只返回打过该标签的邮件（筛选在 SQL 层完成）。 */
+  /**
+   * 列邮件。传 `tagIds` 时只返回打过其中**任一**标签的邮件（OR 语义）。
+   * 空数组 / null 表示不筛选。筛在 SQL 层完成，不在前端过滤。
+   */
   listMessages: (
     accountId: string,
     folder = "INBOX",
     limit = 200,
     offset = 0,
-    tagId: number | null = null,
-  ) => invoke<MessageHeader[]>("list_messages", { accountId, folder, limit, offset, tagId }),
+    tagIds: number[] = [],
+  ) => invoke<MessageHeader[]>("list_messages", { accountId, folder, limit, offset, tagIds }),
   loadMessageBody: (id: number) => invoke<MessageDetail>("load_message_body", { id }),
   setSeen: (id: number, seen: boolean) => invoke<void>("set_seen", { id, seen }),
   setFlagged: (id: number, flagged: boolean) => invoke<void>("set_flagged", { id, flagged }),
@@ -52,6 +56,24 @@ export const api = {
   /** 给单封邮件打 / 取消标签，幂等。 */
   tagMessage: (messageId: number, tagId: number, attached: boolean) =>
     invoke<void>("tag_message", { messageId, tagId, attached }),
+
+  // ---- 标签组 ----
+  listTagGroups: (accountId: string) => invoke<TagGroup[]>("list_tag_groups", { accountId }),
+  createTagGroup: (accountId: string, name: string, color: string, tagIds: number[] = []) =>
+    invoke<TagGroup>("create_tag_group", { accountId, name, color, tagIds }),
+  updateTagGroup: (id: number, patch: { name?: string; color?: string; collapsed?: boolean }) =>
+    invoke<void>("update_tag_group", {
+      id,
+      name: patch.name ?? null,
+      color: patch.color ?? null,
+      collapsed: patch.collapsed ?? null,
+    }),
+  deleteTagGroup: (id: number) => invoke<void>("delete_tag_group", { id }),
+  /** 整组覆盖式设置成员标签。 */
+  setGroupTags: (groupId: number, tagIds: number[]) =>
+    invoke<void>("set_group_tags", { groupId, tagIds }),
+  /** 把多个组展开为标签并集，供「选中组本身」时换算筛选集合。 */
+  resolveGroupTags: (groupIds: number[]) => invoke<number[]>("resolve_group_tags", { groupIds }),
 
   // ---- 发送 ----
   sendMail: (payload: SendPayload) => invoke<void>("send_mail", { payload }),

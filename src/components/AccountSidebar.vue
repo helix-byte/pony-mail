@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 
 import { useMailStore } from "../stores/mail";
-import { avatarColor, avatarText, TAG_PALETTE } from "../utils/format";
+import { avatarColor, avatarText, GROUP_PALETTE, TAG_PALETTE } from "../utils/format";
 
 const store = useMailStore();
 
@@ -59,6 +59,81 @@ function onDeleteTag(id: number, name: string) {
     void store.deleteTag(id);
   }
 }
+
+// ------------------------------------------------------------------
+// 标签组的增 / 改 / 删
+//
+// 组与标签是多对多：同一个标签可以同时出现在多个组里。因此侧栏里
+// 同一标签可能在多个折叠区中各出现一次，这是预期行为而非重复渲染。
+// ------------------------------------------------------------------
+
+const groupEditorOpen = ref(false);
+/** 非 null 表示正在编辑该组；null 表示「新建」态。 */
+const editingGroupId = ref<number | null>(null);
+const groupDraftName = ref("");
+const groupDraftColor = ref(GROUP_PALETTE[0]);
+/** 编辑器里勾选的成员标签 id。 */
+const groupDraftTagIds = ref<number[]>([]);
+
+function openCreateGroup() {
+  editingGroupId.value = null;
+  groupDraftName.value = "";
+  groupDraftColor.value = GROUP_PALETTE[store.groups.length % GROUP_PALETTE.length];
+  groupDraftTagIds.value = [];
+  groupEditorOpen.value = true;
+}
+
+function openEditGroup(id: number) {
+  const g = store.groups.find((x) => x.id === id);
+  if (!g) return;
+  editingGroupId.value = id;
+  groupDraftName.value = g.name;
+  groupDraftColor.value = g.color;
+  groupDraftTagIds.value = [...g.tagIds];
+  groupEditorOpen.value = true;
+}
+
+function closeGroupEditor() {
+  groupEditorOpen.value = false;
+  editingGroupId.value = null;
+}
+
+function toggleDraftTag(tagId: number) {
+  groupDraftTagIds.value = groupDraftTagIds.value.includes(tagId)
+    ? groupDraftTagIds.value.filter((id) => id !== tagId)
+    : [...groupDraftTagIds.value, tagId];
+}
+
+async function submitGroupEditor() {
+  const name = groupDraftName.value.trim();
+  if (!name) return;
+  const tagIds = [...groupDraftTagIds.value];
+  const ok =
+    editingGroupId.value === null
+      ? await store.createGroup(name, groupDraftColor.value, tagIds)
+      : await store.updateGroup(editingGroupId.value, {
+          name,
+          color: groupDraftColor.value,
+          tagIds,
+        });
+  if (ok) closeGroupEditor();
+}
+
+function onDeleteGroup(id: number, name: string) {
+  if (
+    confirm(
+      `确定要删除标签组「${name}」吗？\n组内的标签本身会保留，只是不再归入这个组。`,
+    )
+  ) {
+    void store.deleteGroup(id);
+  }
+}
+
+/** 「未分组」区：统计不属于任何组的标签，方便判断有没有漏归类的。 */
+const ungroupedTags = computed(() => {
+  const grouped = new Set(store.groups.flatMap((g) => g.tagIds));
+  return store.tags.filter((t) => !grouped.has(t.id));
+});
 </script>
 
 <template>
@@ -134,12 +209,22 @@ function onDeleteTag(id: number, name: string) {
           </button>
         </div>
 
-        <!-- 标签 -->
+        <!-- 标签组 / 标签 -->
         <div v-if="a.id === store.activeAccountId" class="mt-2 space-y-0.5 pl-3">
           <div class="flex items-center gap-1 px-2.5 py-1">
             <span class="text-[11px] font-medium uppercase tracking-wider text-zinc-600">标签</span>
             <button
-              class="ml-auto rounded p-1 text-zinc-500 transition hover:bg-panel-2 hover:text-indigo-300"
+              class="ml-auto rounded p-1 text-zinc-500 transition hover:bg-panel-2 hover:text-fuchsia-300"
+              title="新建标签组"
+              @click="openCreateGroup"
+            >
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 7a1 1 0 0 1 1-1h4l2 2h7a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z" stroke-linejoin="round" />
+                <path d="M12 11v5M9.5 13.5h5" stroke-linecap="round" />
+              </svg>
+            </button>
+            <button
+              class="rounded p-1 text-zinc-500 transition hover:bg-panel-2 hover:text-indigo-300"
               title="新建标签"
               @click="openCreate"
             >
@@ -149,55 +234,96 @@ function onDeleteTag(id: number, name: string) {
             </button>
           </div>
 
-          <!-- 「全部」永远在最上面，用于退出标签筛选 -->
+          <!-- 「全部邮件」：清空筛选集合 -->
           <button
             class="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] transition"
             :class="
-              store.activeTagId === null
+              !store.filtering
                 ? 'bg-hover text-zinc-100'
                 : 'text-zinc-400 hover:bg-panel-2 hover:text-zinc-200'
             "
-            @click="store.selectTag(null)"
+            @click="store.clearFilter()"
           >
             <svg class="h-3.5 w-3.5 shrink-0 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M4 6h16M4 12h16M4 18h10" stroke-linecap="round" />
             </svg>
             <span class="truncate">全部邮件</span>
+            <span
+              v-if="store.filtering"
+              class="ml-auto rounded-full bg-accent/20 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-300"
+            >
+              筛选中 {{ store.activeTagIds.length }}
+            </span>
           </button>
 
           <p
-            v-if="store.tags.length === 0"
-            class="px-2.5 py-1 text-[11.5px] text-zinc-600"
+            v-if="store.tags.length === 0 && store.groups.length === 0"
+            class="px-2.5 py-1 text-[11.5px] leading-relaxed text-zinc-600"
           >
             还没有标签，点 + 新建
           </p>
 
-          <div v-for="t in store.tags" :key="t.id" class="group/tag relative">
-            <button
-              class="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] transition"
+          <!-- 标签组：可折叠，组名点击即筛选本组全部标签 -->
+          <!-- `relative` 是必须的：行内的编辑/删除按钮用 absolute right-1.5 定位，
+               缺少它就会锚到更外层的定位祖先上，跑到列表外面去。 -->
+          <div v-for="g in store.groups" :key="`g${g.id}`" class="group/grp relative">
+            <div
+              class="flex items-center gap-1 rounded-md px-1.5 py-1 transition"
               :class="
-                store.activeTagId === t.id
-                  ? 'bg-hover text-zinc-100'
-                  : 'text-zinc-400 hover:bg-panel-2 hover:text-zinc-200'
+                store.activeGroupId === g.id
+                  ? 'bg-hover'
+                  : 'hover:bg-panel-2'
               "
-              @click="store.selectTag(t.id)"
             >
-              <span
-                class="h-2.5 w-2.5 shrink-0 rounded-full"
-                :style="{ background: t.color }"
-              />
-              <span class="min-w-0 flex-1 truncate text-left">{{ t.name }}</span>
-              <span
-                v-if="t.messageCount > 0"
-                class="shrink-0 rounded-full bg-panel-2 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-400 group-hover/tag:opacity-0"
+              <!-- 折叠开关：只切换展开状态，不触发筛选 -->
+              <button
+                class="shrink-0 rounded p-0.5 text-zinc-500 transition hover:text-zinc-200"
+                :title="g.collapsed ? '展开' : '收起'"
+                @click.stop="store.toggleGroupCollapsed(g.id)"
               >
-                {{ t.messageCount }}
+                <svg
+                  class="h-3 w-3 transition"
+                  :class="g.collapsed ? '' : 'rotate-90'"
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                >
+                  <path d="M9 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+
+              <!-- 组名：点击筛选本组（再次点击取消） -->
+              <button
+                class="flex min-w-0 flex-1 items-center gap-1.5 text-left text-[12.5px]"
+                :title="`筛选「${g.name}」组内 ${g.tagIds.length} 个标签`"
+                @click="store.selectGroup(g.id)"
+              >
+                <svg
+                  class="h-3.5 w-3.5 shrink-0"
+                  :style="{ color: g.color }"
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                >
+                  <path d="M3 7a1 1 0 0 1 1-1h4l2 2h7a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z" stroke-linejoin="round" />
+                </svg>
+                <span
+                  class="min-w-0 flex-1 truncate"
+                  :class="store.activeGroupId === g.id ? 'font-medium text-zinc-100' : 'text-zinc-300'"
+                >
+                  {{ g.name }}
+                </span>
+                <span class="shrink-0 text-[10px] text-zinc-600">{{ g.tagIds.length }}</span>
+              </button>
+
+              <span
+                v-if="g.messageCount > 0"
+                class="shrink-0 rounded-full bg-panel-2 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-400 group-hover/grp:opacity-0"
+              >
+                {{ g.messageCount }}
               </span>
-              <span class="absolute right-1.5 flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover/tag:opacity-100">
+
+              <span class="absolute right-1.5 flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover/grp:opacity-100">
                 <span
                   class="rounded p-1 text-zinc-500 transition hover:bg-panel hover:text-zinc-200"
-                  title="重命名 / 改色"
-                  @click.stop="openEdit(t.id)"
+                  title="编辑组"
+                  @click.stop="openEditGroup(g.id)"
                 >
                   <svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" stroke-linecap="round" stroke-linejoin="round" />
@@ -205,15 +331,135 @@ function onDeleteTag(id: number, name: string) {
                 </span>
                 <span
                   class="rounded p-1 text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-400"
-                  title="删除标签"
-                  @click.stop="onDeleteTag(t.id, t.name)"
+                  title="删除组"
+                  @click.stop="onDeleteGroup(g.id, g.name)"
                 >
                   <svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
                   </svg>
                 </span>
               </span>
-            </button>
+            </div>
+
+            <!-- 组内标签：多选勾选，OR 语义 -->
+            <div v-if="!g.collapsed" class="ml-3 space-y-0.5 border-l border-line/70 pl-2">
+              <p
+                v-if="g.tagIds.length === 0"
+                class="px-2 py-1 text-[11px] text-zinc-600"
+              >
+                组内暂无标签，点编辑添加
+              </p>
+              <div
+                v-for="t in g.tagIds.map((id) => store.tags.find((x) => x.id === id)).filter(Boolean)"
+                :key="`gt${g.id}-${t!.id}`"
+                class="group/tag relative"
+              >
+                <button
+                  class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[12.5px] transition"
+                  :class="
+                    store.activeTagIds.includes(t!.id)
+                      ? 'bg-hover text-zinc-100'
+                      : 'text-zinc-400 hover:bg-panel-2 hover:text-zinc-200'
+                  "
+                  @click="store.toggleTagFilter(t!.id)"
+                >
+                  <!-- 勾选框：多选状态一目了然 -->
+                  <span
+                    class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
+                    :class="
+                      store.activeTagIds.includes(t!.id)
+                        ? 'border-transparent text-white'
+                        : 'border-zinc-600'
+                    "
+                    :style="store.activeTagIds.includes(t!.id) ? { background: t!.color } : {}"
+                  >
+                    <svg
+                      v-if="store.activeTagIds.includes(t!.id)"
+                      class="h-2.5 w-2.5"
+                      viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
+                    >
+                      <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </span>
+                  <span class="min-w-0 flex-1 truncate text-left">{{ t!.name }}</span>
+                  <span
+                    v-if="t!.messageCount > 0"
+                    class="shrink-0 rounded-full bg-panel-2 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-400 group-hover/tag:opacity-0"
+                  >
+                    {{ t!.messageCount }}
+                  </span>
+                  <span class="absolute right-1.5 flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover/tag:opacity-100">
+                    <span
+                      class="rounded p-1 text-zinc-500 transition hover:bg-panel hover:text-zinc-200"
+                      title="编辑标签"
+                      @click.stop="openEdit(t!.id)"
+                    >
+                      <svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    </span>
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 未归组标签：多对多下需要单独兜住没进任何组的标签 -->
+          <div v-if="ungroupedTags.length" class="pt-1">
+            <p class="px-2.5 py-1 text-[10.5px] font-medium uppercase tracking-wider text-zinc-600">
+              未分组
+            </p>
+            <div
+              v-for="t in ungroupedTags"
+              :key="`u${t.id}`"
+              class="group/tag relative"
+            >
+              <button
+                class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[12.5px] transition"
+                :class="
+                  store.activeTagIds.includes(t.id)
+                    ? 'bg-hover text-zinc-100'
+                    : 'text-zinc-400 hover:bg-panel-2 hover:text-zinc-200'
+                "
+                @click="store.toggleTagFilter(t.id)"
+              >
+                <span
+                  class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
+                  :class="
+                    store.activeTagIds.includes(t.id)
+                      ? 'border-transparent text-white'
+                      : 'border-zinc-600'
+                  "
+                  :style="store.activeTagIds.includes(t.id) ? { background: t.color } : {}"
+                >
+                  <svg
+                    v-if="store.activeTagIds.includes(t.id)"
+                    class="h-2.5 w-2.5"
+                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
+                  >
+                    <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+                <span class="min-w-0 flex-1 truncate text-left">{{ t.name }}</span>
+                <span
+                  v-if="t.messageCount > 0"
+                  class="shrink-0 rounded-full bg-panel-2 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-400 group-hover/tag:opacity-0"
+                >
+                  {{ t.messageCount }}
+                </span>
+                <span class="absolute right-1.5 flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover/tag:opacity-100">
+                  <span
+                    class="rounded p-1 text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-400"
+                    title="删除标签"
+                    @click.stop="onDeleteTag(t.id, t.name)"
+                  >
+                    <svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+                    </svg>
+                  </span>
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -298,6 +544,122 @@ function onDeleteTag(id: number, name: string) {
           <button
             class="ml-auto rounded-lg px-3 py-2 text-[12.5px] text-zinc-400 transition hover:bg-panel-2 hover:text-zinc-200"
             @click="closeEditor"
+          >
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+
+  <!-- 标签组编辑器 -->
+  <Teleport to="body">
+    <div
+      v-if="groupEditorOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm"
+      @click.self="closeGroupEditor"
+    >
+      <div class="flex max-h-full w-full max-w-sm flex-col overflow-hidden rounded-2xl border border-line bg-panel shadow-2xl">
+        <div class="shrink-0 border-b border-line px-5 py-3.5">
+          <h2 class="text-[13.5px] font-semibold text-zinc-100">
+            {{ editingGroupId === null ? "新建标签组" : "编辑标签组" }}
+          </h2>
+          <p class="mt-0.5 text-[11.5px] text-zinc-500">
+            组是标签的合集，点击组名可一次筛选组内全部标签
+          </p>
+        </div>
+
+        <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+          <label class="block">
+            <span class="mb-1 block text-[12px] text-zinc-400">组名</span>
+            <input
+              v-model="groupDraftName"
+              class="w-full rounded-lg border border-line bg-panel-2 px-3 py-2 text-[13px] text-zinc-200 outline-none transition focus:border-accent/60"
+              placeholder="例如：本周关注、客户、财务"
+              maxlength="24"
+              autofocus
+              @keydown.enter="submitGroupEditor"
+              @keydown.esc="closeGroupEditor"
+            />
+          </label>
+
+          <div>
+            <span class="mb-1.5 block text-[12px] text-zinc-400">颜色</span>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="c in GROUP_PALETTE"
+                :key="c"
+                class="h-6 w-6 rounded-full transition"
+                :class="c === groupDraftColor ? 'ring-2 ring-white/70 ring-offset-2 ring-offset-panel' : 'hover:scale-110'"
+                :style="{ background: c }"
+                :title="c"
+                @click="groupDraftColor = c"
+              />
+            </div>
+          </div>
+
+          <div>
+            <div class="mb-1.5 flex items-baseline gap-2">
+              <span class="text-[12px] text-zinc-400">组内标签</span>
+              <span class="text-[11px] text-zinc-600">
+                已选 {{ groupDraftTagIds.length }}
+              </span>
+              <span class="ml-auto text-[10.5px] text-zinc-600">同一标签可属于多个组</span>
+            </div>
+
+            <p v-if="store.tags.length === 0" class="rounded-lg border border-dashed border-line px-3 py-3 text-center text-[12px] text-zinc-500">
+              还没有标签，请先在上方 + 里新建标签
+            </p>
+
+            <div v-else class="space-y-0.5">
+              <button
+                v-for="t in store.tags"
+                :key="`pick${t.id}`"
+                class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[12.5px] transition hover:bg-panel-2"
+                @click="toggleDraftTag(t.id)"
+              >
+                <span
+                  class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
+                  :class="
+                    groupDraftTagIds.includes(t.id)
+                      ? 'border-transparent text-white'
+                      : 'border-zinc-600'
+                  "
+                  :style="groupDraftTagIds.includes(t.id) ? { background: t.color } : {}"
+                >
+                  <svg
+                    v-if="groupDraftTagIds.includes(t.id)"
+                    class="h-2.5 w-2.5"
+                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
+                  >
+                    <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </span>
+                <span class="h-2.5 w-2.5 shrink-0 rounded-full" :style="{ background: t.color }" />
+                <span class="min-w-0 flex-1 truncate text-zinc-300">{{ t.name }}</span>
+                <span
+                  v-if="store.groupsOfTag(t.id).length"
+                  class="shrink-0 text-[10px] text-zinc-600"
+                  :title="`已在 ${store.groupsOfTag(t.id).map((x) => x.name).join('、')} 组中`"
+                >
+                  {{ store.groupsOfTag(t.id).length }} 组
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex shrink-0 items-center gap-3 border-t border-line px-5 py-3.5">
+          <button
+            class="rounded-lg bg-accent px-4 py-2 text-[12.5px] font-medium text-white transition hover:bg-indigo-500 disabled:opacity-40"
+            :disabled="!groupDraftName.trim()"
+            @click="submitGroupEditor"
+          >
+            {{ editingGroupId === null ? "创建" : "保存" }}
+          </button>
+          <button
+            class="ml-auto rounded-lg px-3 py-2 text-[12.5px] text-zinc-400 transition hover:bg-panel-2 hover:text-zinc-200"
+            @click="closeGroupEditor"
           >
             取消
           </button>

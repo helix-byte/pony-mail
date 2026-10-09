@@ -56,6 +56,23 @@ export const TAG_PALETTE: string[] = [
   "#64748b",
 ];
 
+/**
+ * 标签组可选色板。
+ *
+ * 刻意与 TAG_PALETTE 错开色相重心（偏向紫/青/玫红），
+ * 让侧栏里「组」和「标签」在视觉上能一眼分辨层级。
+ */
+export const GROUP_PALETTE: string[] = [
+  "#8b5cf6",
+  "#a855f7",
+  "#d946ef",
+  "#0891b2",
+  "#0d9488",
+  "#7c3aed",
+  "#c026d3",
+  "#0e7490",
+];
+
 /** 依据字符串生成稳定的头像底色（保证同一发件人颜色一致）。 */
 export function avatarColor(seed: string): string {
   const palette = [

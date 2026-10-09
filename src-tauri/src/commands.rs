@@ -156,6 +156,7 @@ fn sync_folder(
     })
 }
 
+/// 列邮件；传 `tag_ids` 时只返回打过其中**任一**标签的邮件（OR 语义，筛选在 SQL 层完成）。
 #[tauri::command]
 pub fn list_messages(
     state: State<'_, AppState>,
@@ -163,14 +164,15 @@ pub fn list_messages(
     folder: String,
     limit: u32,
     offset: u32,
-    tag_id: Option<i64>,
+    tag_ids: Option<Vec<i64>>,
 ) -> AppResult<Vec<MessageHeader>> {
-    state.store.list_messages_filtered(
+    let ids = tag_ids.unwrap_or_default();
+    state.store.list_messages_multi(
         &account_id,
         &folder,
         limit.clamp(1, 500),
         offset,
-        tag_id,
+        &ids,
     )
 }
 
@@ -405,6 +407,77 @@ pub fn tag_message(
 
 /// 单个标签的默认色板，与前端保持一致，避免新建后颜色随机跳变。
 const DEFAULT_TAG_COLOR: &str = "#6366f1";
+/// 标签组的默认色，刻意与标签默认色区分开，便于侧栏一眼分辨层级。
+const DEFAULT_GROUP_COLOR: &str = "#8b5cf6";
+
+// ---------------------------------------------------------------------
+// 标签组
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_tag_groups(state: State<'_, AppState>, account_id: String) -> AppResult<Vec<TagGroup>> {
+    state.store.list_tag_groups(&account_id)
+}
+
+#[tauri::command]
+pub fn create_tag_group(
+    state: State<'_, AppState>,
+    account_id: String,
+    name: String,
+    color: Option<String>,
+    tag_ids: Option<Vec<i64>>,
+) -> AppResult<TagGroup> {
+    let color = color.unwrap_or_else(|| DEFAULT_GROUP_COLOR.to_string());
+    let now = Utc::now().to_rfc3339();
+    let group = state
+        .store
+        .create_tag_group(&account_id, &name, &color, &now)?;
+    // 允许建组时一并指定成员，省去「先建空组再拉标签进去」的两步操作。
+    if let Some(ids) = tag_ids {
+        if !ids.is_empty() {
+            state.store.set_group_tags(group.id, &ids, &now)?;
+        }
+    }
+    // 回读一次，让返回的对象带上成员与计数，前端可直接插入列表。
+    Ok(state
+        .store
+        .list_tag_groups(&account_id)?
+        .into_iter()
+        .find(|g| g.id == group.id)
+        .unwrap_or(group))
+}
+
+#[tauri::command]
+pub fn update_tag_group(
+    state: State<'_, AppState>,
+    id: i64,
+    name: Option<String>,
+    color: Option<String>,
+    collapsed: Option<bool>,
+) -> AppResult<()> {
+    state
+        .store
+        .update_tag_group(id, name.as_deref(), color.as_deref(), collapsed)
+}
+
+#[tauri::command]
+pub fn delete_tag_group(state: State<'_, AppState>, id: i64) -> AppResult<()> {
+    state.store.delete_tag_group(id)
+}
+
+/// 整组覆盖式设置成员标签。只影响组成员关系，不动标签本身与邮件打标。
+#[tauri::command]
+pub fn set_group_tags(state: State<'_, AppState>, group_id: i64, tag_ids: Vec<i64>) -> AppResult<()> {
+    state
+        .store
+        .set_group_tags(group_id, &tag_ids, &Utc::now().to_rfc3339())
+}
+
+/// 把多个组展开为标签并集，供「选中组本身」时换算成实际的筛选标签集合。
+#[tauri::command]
+pub fn resolve_group_tags(state: State<'_, AppState>, group_ids: Vec<i64>) -> AppResult<Vec<i64>> {
+    state.store.groups_tag_ids(&group_ids)
+}
 
 // ---------------------------------------------------------------------
 // 发送

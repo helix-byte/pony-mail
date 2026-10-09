@@ -6,10 +6,15 @@ import { avatarColor, avatarText, formatDate } from "../utils/format";
 
 const store = useMailStore();
 
-/** 列表工具条的标题：跟随标签筛选显示「收件箱 · 工作」之类。 */
-const listScopeLabel = computed(() =>
-  store.activeTag ? `收件箱 · ${store.activeTag.name}` : "收件箱",
-);
+/** 列表工具条的标题：跟随筛选状态显示当前范围。 */
+const listScopeLabel = computed(() => {
+  if (store.activeGroup) return `收件箱 · ${store.activeGroup.name}`;
+  if (store.filtering) {
+    const n = store.activeTagIds.length;
+    return n === 1 ? `收件箱 · ${store.activeTags[0]?.name ?? ""}` : `收件箱 · ${n} 个标签`;
+  }
+  return "收件箱";
+});
 
 /** 判断某封邮件是否已挂某个标签。 */
 function hasTag(messageId: number, tagId: number): boolean {
@@ -139,14 +144,23 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <button
-        v-if="store.activeTag"
-        class="flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[11.5px] text-zinc-300 transition hover:border-accent/50 hover:text-indigo-300"
-        title="退出标签筛选"
-        @click="store.selectTag(null)"
+        v-if="store.filtering"
+        class="flex h-7 max-w-[180px] shrink-0 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[11.5px] text-zinc-300 transition hover:border-accent/50 hover:text-indigo-300"
+        title="清空筛选，查看全部邮件"
+        @click="store.clearFilter()"
       >
-        <span class="h-2 w-2 rounded-full" :style="{ background: store.activeTag.color }" />
-        {{ store.activeTag.name }}
-        <svg class="h-3 w-3 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <span
+          v-if="store.activeGroup"
+          class="h-2 w-2 shrink-0 rounded-full"
+          :style="{ background: store.activeGroup.color }"
+        />
+        <span class="min-w-0 truncate">
+          <template v-if="store.activeGroup">{{ store.activeGroup.name }}</template>
+          <template v-else-if="store.activeTags.length === 1">{{ store.activeTags[0]?.name }}</template>
+          <template v-else>{{ store.activeTags.length }} 个标签</template>
+        </span>
+        <span class="shrink-0 text-zinc-500">· {{ store.messages.length }} 封</span>
+        <svg class="h-3 w-3 shrink-0 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
         </svg>
       </button>

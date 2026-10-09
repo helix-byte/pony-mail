@@ -55,6 +55,27 @@ export interface Tag {
   messageCount: number;
 }
 
+/**
+ * 标签组：可点击筛选的标签合集，组内标签取并集（OR）。
+ *
+ * 与标签是**多对多**关系，同一标签可同时归入多个组。
+ */
+export interface TagGroup {
+  id: number;
+  accountId: string;
+  name: string;
+  color: string;
+  sortOrder: number;
+  /** 侧栏折叠状态，持久化在后端。 */
+  collapsed: boolean;
+  /** 组内标签 id。 */
+  tagIds: number[];
+  /** 组内**去重后**的邮件数（一封邮件带组内多个标签只算一次）。 */
+  messageCount: number;
+  /** 组内各标签邮件数之和（含重复计数），与 messageCount 的差值即重叠量。 */
+  rawMessageCount: number;
+}
+
 export interface AttachmentMeta {
   filename: string;
   mime: string;

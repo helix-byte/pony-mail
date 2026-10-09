@@ -11,6 +11,7 @@ import type {
   SendPayload,
   Summary,
   SyncReport,
+  Tag,
   TestReport,
 } from "./types";
 
@@ -27,13 +28,30 @@ export const api = {
   // ---- 同步与读取 ----
   syncInbox: (accountId: string, folder = "INBOX", limit = 40) =>
     invoke<SyncReport>("sync_inbox", { accountId, folder, limit }),
-  listMessages: (accountId: string, folder = "INBOX", limit = 200, offset = 0) =>
-    invoke<MessageHeader[]>("list_messages", { accountId, folder, limit, offset }),
+  /** 列邮件；传 `tagId` 时只返回打过该标签的邮件（筛选在 SQL 层完成）。 */
+  listMessages: (
+    accountId: string,
+    folder = "INBOX",
+    limit = 200,
+    offset = 0,
+    tagId: number | null = null,
+  ) => invoke<MessageHeader[]>("list_messages", { accountId, folder, limit, offset, tagId }),
   loadMessageBody: (id: number) => invoke<MessageDetail>("load_message_body", { id }),
   setSeen: (id: number, seen: boolean) => invoke<void>("set_seen", { id, seen }),
   setFlagged: (id: number, flagged: boolean) => invoke<void>("set_flagged", { id, flagged }),
   deleteMessage: (id: number) => invoke<DeleteReport>("delete_message", { id }),
   deleteMessages: (ids: number[]) => invoke<DeleteReport>("delete_messages", { ids }),
+
+  // ---- 标签 ----
+  listTags: (accountId: string) => invoke<Tag[]>("list_tags", { accountId }),
+  createTag: (accountId: string, name: string, color: string) =>
+    invoke<Tag>("create_tag", { accountId, name, color }),
+  updateTag: (id: number, patch: { name?: string; color?: string }) =>
+    invoke<void>("update_tag", { id, name: patch.name ?? null, color: patch.color ?? null }),
+  deleteTag: (id: number) => invoke<void>("delete_tag", { id }),
+  /** 给单封邮件打 / 取消标签，幂等。 */
+  tagMessage: (messageId: number, tagId: number, attached: boolean) =>
+    invoke<void>("tag_message", { messageId, tagId, attached }),
 
   // ---- 发送 ----
   sendMail: (payload: SendPayload) => invoke<void>("send_mail", { payload }),

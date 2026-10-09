@@ -1,10 +1,22 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, reactive } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive } from "vue";
 
 import { useMailStore } from "../stores/mail";
 import { avatarColor, avatarText, formatDate } from "../utils/format";
 
 const store = useMailStore();
+
+/** 列表工具条的标题：跟随标签筛选显示「收件箱 · 工作」之类。 */
+const listScopeLabel = computed(() =>
+  store.activeTag ? `收件箱 · ${store.activeTag.name}` : "收件箱",
+);
+
+/** 判断某封邮件是否已挂某个标签。 */
+function hasTag(messageId: number, tagId: number): boolean {
+  return (
+    store.messages.find((m) => m.id === messageId)?.tagIds.includes(tagId) ?? false
+  );
+}
 
 // ------------------------------------------------------------------
 // 右键菜单
@@ -19,23 +31,28 @@ const menu = reactive({
   x: 0,
   y: 0,
   messageId: null as number | null,
+  /** 展开的二级菜单：标签打标面板。 */
+  tagPanelOpen: false,
 });
 
 /** 打开右键菜单：把光标位置夹回视口内，避免菜单溢出屏幕。 */
 function openMenu(e: MouseEvent, id: number) {
   e.preventDefault();
   menu.messageId = id;
-  // 菜单约 172×140，留 8px 边距做安全区。
+  menu.tagPanelOpen = false;
+  // 菜单最宽 176（标签面板展开后仍是这个宽度，只是变高），
+  // 高度上限按标签面板展开后的情形保守估计，直接按最大高度夹一次即可。
   const w = 176;
-  const h = 148;
-  menu.x = Math.min(e.clientX, window.innerWidth - w - 8);
-  menu.y = Math.min(e.clientY, window.innerHeight - h - 8);
+  const h = 300;
+  menu.x = Math.min(Math.max(e.clientX, 8), Math.max(8, window.innerWidth - w - 8));
+  menu.y = Math.min(Math.max(e.clientY, 8), Math.max(8, window.innerHeight - h - 8));
   menu.visible = true;
 }
 
 function closeMenu() {
   menu.visible = false;
   menu.messageId = null;
+  menu.tagPanelOpen = false;
 }
 
 /** 菜单项是否作用于「当前正打开的邮件」，用于决定删除后要不要清空阅读区。 */
@@ -79,6 +96,13 @@ function onDelete() {
   }
 }
 
+/** 在右键菜单里切换标签：菜单保持打开，方便连续勾选多个标签。 */
+function onMenuToggleTag(tagId: number) {
+  const id = menu.messageId;
+  if (id === null) return;
+  void store.toggleMessageTag(id, tagId);
+}
+
 // 滚动 / 缩放 / 按 Esc 都应关闭菜单，否则菜单会「漂」在错误位置。
 function onKeydown(e: KeyboardEvent) {
   if (e.key === "Escape") closeMenu();
@@ -110,10 +134,22 @@ onBeforeUnmount(() => {
           {{ store.activeAccount?.email ?? "未选择账号" }}
         </p>
         <p class="truncate text-[11px] text-zinc-500">
-          收件箱 · {{ store.messages.length }} 封
+          {{ listScopeLabel }} · {{ store.messages.length }} 封
           <template v-if="store.lastSync"> · 上次同步 {{ store.lastSync }}</template>
         </p>
       </div>
+      <button
+        v-if="store.activeTag"
+        class="flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[11.5px] text-zinc-300 transition hover:border-accent/50 hover:text-indigo-300"
+        title="退出标签筛选"
+        @click="store.selectTag(null)"
+      >
+        <span class="h-2 w-2 rounded-full" :style="{ background: store.activeTag.color }" />
+        {{ store.activeTag.name }}
+        <svg class="h-3 w-3 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+        </svg>
+      </button>
       <button
         class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-line text-zinc-400 transition hover:border-accent/50 hover:text-indigo-300 disabled:opacity-40"
         :disabled="store.busy.sync || !store.activeAccountId"
@@ -210,6 +246,22 @@ onBeforeUnmount(() => {
             </svg>
           </span>
 
+          <!-- 标签单独一行：混在摘要行里会把摘要挤没，标签多时尤其难看 -->
+          <span
+            v-if="store.tagsOf(m.id).length"
+            class="mt-1 flex flex-wrap items-center gap-1"
+          >
+            <span
+              v-for="t in store.tagsOf(m.id)"
+              :key="t.id"
+              class="inline-flex max-w-[130px] items-center gap-1 rounded-full px-1.5 py-[1px] text-[10px] font-medium"
+              :style="{ background: `${t.color}26`, color: t.color }"
+            >
+              <span class="h-1.5 w-1.5 shrink-0 rounded-full" :style="{ background: t.color }" />
+              <span class="truncate">{{ t.name }}</span>
+            </span>
+          </span>
+
           <span class="mt-1 block truncate text-[11.5px] text-zinc-500">
             {{ m.snippet || "（正文未加载）" }}
           </span>
@@ -274,6 +326,73 @@ onBeforeUnmount(() => {
           </svg>
           {{ menu.messageId !== null && isFlagged(menu.messageId) ? "取消星标" : "标记星标" }}
         </button>
+
+        <div class="my-1 h-px bg-line" />
+
+        <!-- 标签：展开一个可连续勾选的子面板 -->
+        <button
+          class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-zinc-300 transition hover:bg-hover"
+          @click="menu.tagPanelOpen = !menu.tagPanelOpen"
+        >
+          <svg class="h-3.5 w-3.5 shrink-0 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M3 11V5a2 2 0 0 1 2-2h6l10 10-8 8L3 11z" stroke-linejoin="round" />
+            <circle cx="7.5" cy="7.5" r="1.3" />
+          </svg>
+          标签
+          <span
+            v-if="menu.messageId !== null && store.tagsOf(menu.messageId).length"
+            class="rounded-full bg-accent/20 px-1.5 text-[10px] font-semibold text-indigo-300"
+          >
+            {{ store.tagsOf(menu.messageId).length }}
+          </span>
+          <svg
+            class="ml-auto h-3.5 w-3.5 shrink-0 text-zinc-500 transition"
+            :class="menu.tagPanelOpen ? 'rotate-90' : ''"
+            viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          >
+            <path d="M9 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
+
+        <div v-if="menu.tagPanelOpen" class="max-h-56 overflow-y-auto border-y border-line/70 bg-panel-2/40 py-1">
+          <p v-if="store.tags.length === 0" class="px-3 py-2 text-[11.5px] leading-relaxed text-zinc-500">
+            还没有标签。先去左侧栏「标签」处新建一个。
+          </p>
+          <button
+            v-for="t in store.tags"
+            :key="t.id"
+            class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-zinc-300 transition hover:bg-hover"
+            @click="menu.messageId !== null && onMenuToggleTag(t.id)"
+          >
+            <span
+              class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
+              :class="
+                menu.messageId !== null && hasTag(menu.messageId, t.id)
+                  ? 'border-transparent text-white'
+                  : 'border-zinc-600'
+              "
+              :style="
+                menu.messageId !== null && hasTag(menu.messageId, t.id)
+                  ? { background: t.color }
+                  : {}
+              "
+            >
+              <svg
+                v-if="menu.messageId !== null && hasTag(menu.messageId, t.id)"
+                class="h-2.5 w-2.5"
+                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
+              >
+                <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </span>
+            <span
+              class="h-2.5 w-2.5 shrink-0 rounded-full"
+              :style="{ background: t.color }"
+            />
+            <span class="min-w-0 flex-1 truncate">{{ t.name }}</span>
+            <span class="shrink-0 text-[10.5px] text-zinc-600">{{ t.messageCount }}</span>
+          </button>
+        </div>
 
         <div class="my-1 h-px bg-line" />
 

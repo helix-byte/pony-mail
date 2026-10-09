@@ -42,6 +42,20 @@ export function avatarText(name: string, email: string): string {
   return e ? e.slice(0, 1).toUpperCase() : "?";
 }
 
+/** 标签可选色板。新建标签时按序轮转取色，保证互不撞色。 */
+export const TAG_PALETTE: string[] = [
+  "#6366f1",
+  "#8b5cf6",
+  "#ec4899",
+  "#f97316",
+  "#14b8a6",
+  "#0ea5e9",
+  "#84cc16",
+  "#f43f5e",
+  "#eab308",
+  "#64748b",
+];
+
 /** 依据字符串生成稳定的头像底色（保证同一发件人颜色一致）。 */
 export function avatarColor(seed: string): string {
   const palette = [

@@ -56,6 +56,21 @@ pub struct MessageHeader {
     pub has_attachments: bool,
     pub body_loaded: bool,
     pub snippet: String,
+    /// 该邮件携带的标签。列表页直接渲染，避免逐封再查一次接口。
+    pub tag_ids: Vec<i64>,
+}
+
+/// 用户自定义标签（按账号隔离，同一账号下名称唯一）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub id: i64,
+    pub account_id: String,
+    pub name: String,
+    pub color: String,
+    pub sort_order: i64,
+    /// 该标签下已打标的邮件数，用于侧栏角标。
+    pub message_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

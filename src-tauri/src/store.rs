@@ -75,6 +75,26 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tags (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    color       TEXT NOT NULL DEFAULT '#6366f1',
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL DEFAULT '',
+    UNIQUE (account_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS message_tags (
+    message_id  INTEGER NOT NULL,
+    tag_id      INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (message_id, tag_id)
+);
+
+-- 按标签筛邮件时走这个索引；反过来查「某封邮件的标签」走主键前缀。
+CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags (tag_id, message_id);
 "#;
 
 /// SQLite 仓储层。每次操作独立开连接（SQLite 打开成本极低），
@@ -176,6 +196,12 @@ impl Store {
 
     pub fn delete_account(&self, id: &str) -> AppResult<()> {
         let conn = self.conn()?;
+        // 先清打标关系（依赖 tags 表尚未删除），再删标签，最后删账号及其邮件。
+        conn.execute(
+            "DELETE FROM message_tags WHERE tag_id IN (SELECT id FROM tags WHERE account_id = ?1)",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM tags WHERE account_id = ?1", params![id])?;
         conn.execute("DELETE FROM messages WHERE account_id = ?1", params![id])?;
         conn.execute("DELETE FROM folders WHERE account_id = ?1", params![id])?;
         conn.execute("DELETE FROM sync_state WHERE account_id = ?1", params![id])?;
@@ -335,24 +361,93 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> AppResult<Vec<MessageHeader>> {
+        self.list_messages_filtered(account_id, folder, limit, offset, None)
+    }
+
+    /// 列邮件，可附带「限定某一标签」。`tag_id` 为 `None` 表示不筛选。
+    ///
+    /// 标签筛选**下推到 SQL**（EXISTS 子查询），而不是捞出全表后在应用层过滤——
+    /// 后者会让「按标签看邮件」在大收件箱下先加载几千条再丢掉绝大多数。
+    pub fn list_messages_filtered(
+        &self,
+        account_id: &str,
+        folder: &str,
+        limit: u32,
+        offset: u32,
+        tag_id: Option<i64>,
+    ) -> AppResult<Vec<MessageHeader>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, uid, folder, subject, from_name, from_addr, date_ts,
                     seen, flagged, has_attachments, body_loaded, snippet
              FROM messages
              WHERE account_id = ?1 AND folder = ?2
+               AND (?5 IS NULL OR EXISTS (
+                     SELECT 1 FROM message_tags mt
+                     WHERE mt.message_id = messages.id AND mt.tag_id = ?5))
              ORDER BY date_ts DESC, id DESC
              LIMIT ?3 OFFSET ?4",
         )?;
         let rows = stmt.query_map(
-            params![account_id, folder, limit as i64, offset as i64],
+            params![account_id, folder, limit as i64, offset as i64, tag_id],
             row_to_header,
         )?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
         }
+        drop(stmt);
+        self.attach_tags(&conn, account_id, &mut out)?;
         Ok(out)
+    }
+
+    /// 给一批邮件头补上各自的标签 id 集合。
+    ///
+    /// 用一次 `IN (...)` 查询取代「每封邮件查一次」——列表默认 200 条，
+    /// 逐封查就是 200 次往返，是典型的 N+1。
+    fn attach_tags(
+        &self,
+        conn: &Connection,
+        account_id: &str,
+        headers: &mut [MessageHeader],
+    ) -> AppResult<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = headers.iter().map(|h| h.id).collect();
+        // 参数占位符按实际长度拼接；值本身仍走绑定，不做字符串拼接。
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT mt.message_id, mt.tag_id
+             FROM message_tags mt
+             JOIN tags t ON t.id = mt.tag_id
+             WHERE t.account_id = ? AND mt.message_id IN ({placeholders})"
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        values.push(Box::new(account_id.to_string()));
+        for id in &ids {
+            values.push(Box::new(*id));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut pairs: Vec<(i64, i64)> = Vec::new();
+        for r in rows {
+            pairs.push(r?);
+        }
+        drop(stmt);
+
+        for h in headers.iter_mut() {
+            h.tag_ids = pairs
+                .iter()
+                .filter(|(mid, _)| *mid == h.id)
+                .map(|(_, tid)| *tid)
+                .collect();
+        }
+        Ok(())
     }
 
     pub fn get_message(&self, id: i64) -> AppResult<MessageDetail> {
@@ -428,6 +523,11 @@ impl Store {
             "DELETE FROM ai_cache WHERE cache_key LIKE ?1",
             params![format!("summary:{id}:%")],
         )?;
+        // 打标关系一并清掉，避免标签角标统计到已删除的邮件。
+        tx.execute(
+            "DELETE FROM message_tags WHERE message_id = ?1",
+            params![id],
+        )?;
         tx.commit()?;
         Ok(removed > 0)
     }
@@ -446,6 +546,7 @@ impl Store {
                 "DELETE FROM ai_cache WHERE cache_key LIKE ?1",
                 params![format!("summary:{id}:%")],
             )?;
+            tx.execute("DELETE FROM message_tags WHERE message_id = ?1", params![id])?;
         }
         tx.commit()?;
         Ok(removed)
@@ -481,6 +582,227 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(v as u32)
+    }
+
+    // ------------------------------------------------------------------
+    // 标签
+    // ------------------------------------------------------------------
+
+    /// 列出某账号下的全部标签，附带各自的邮件数。
+    ///
+    /// 计数用 LEFT JOIN 聚合而不是对每个标签发一条 COUNT——
+    /// 侧栏渲染要显示每个标签的角标，N 个标签就是 N 次查询。
+    pub fn list_tags(&self, account_id: &str) -> AppResult<Vec<Tag>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.account_id, t.name, t.color, t.sort_order,
+                    COUNT(mt.message_id) AS message_count
+             FROM tags t
+             LEFT JOIN message_tags mt ON mt.tag_id = t.id
+             WHERE t.account_id = ?1
+             GROUP BY t.id
+             ORDER BY t.sort_order ASC, t.id ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id], |row| {
+            Ok(Tag {
+                id: row.get("id")?,
+                account_id: row.get("account_id")?,
+                name: row.get("name")?,
+                color: row.get("color")?,
+                sort_order: row.get("sort_order")?,
+                message_count: row.get("message_count")?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 新建标签。同名时返回 `AppError::Other`（由 UNIQUE 约束兜底，先查一次给出可读文案）。
+    pub fn create_tag(
+        &self,
+        account_id: &str,
+        name: &str,
+        color: &str,
+        created_at: &str,
+    ) -> AppResult<Tag> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Other("标签名不能为空".to_string()));
+        }
+        if name.chars().count() > 24 {
+            return Err(AppError::Other("标签名不宜超过 24 个字符".to_string()));
+        }
+        let conn = self.conn()?;
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM tags WHERE account_id = ?1 AND name = ?2",
+                params![account_id, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            return Err(AppError::Other(format!("标签「{name}」已存在")));
+        }
+
+        // 新标签排在末尾：取当前最大 sort_order + 1。
+        let next_order: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM tags WHERE account_id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        conn.execute(
+            "INSERT INTO tags (account_id, name, color, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![account_id, name, color, next_order, created_at],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(Tag {
+            id,
+            account_id: account_id.to_string(),
+            name: name.to_string(),
+            color: color.to_string(),
+            sort_order: next_order,
+            message_count: 0,
+        })
+    }
+
+    /// 重命名 / 改色。名称冲突时给出可读错误。
+    pub fn update_tag(&self, id: i64, name: Option<&str>, color: Option<&str>) -> AppResult<()> {
+        let conn = self.conn()?;
+        if let Some(raw) = name {
+            let name = raw.trim();
+            if name.is_empty() {
+                return Err(AppError::Other("标签名不能为空".to_string()));
+            }
+            if name.chars().count() > 24 {
+                return Err(AppError::Other("标签名不宜超过 24 个字符".to_string()));
+            }
+            let account_id: String = conn
+                .query_row("SELECT account_id FROM tags WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or_else(|| AppError::Other("标签不存在".to_string()))?;
+            let clash: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM tags WHERE account_id = ?1 AND name = ?2 AND id <> ?3",
+                    params![account_id, name, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if clash.is_some() {
+                return Err(AppError::Other(format!("标签「{name}」已存在")));
+            }
+            conn.execute("UPDATE tags SET name = ?1 WHERE id = ?2", params![name, id])?;
+        }
+        if let Some(color) = color {
+            conn.execute("UPDATE tags SET color = ?1 WHERE id = ?2", params![color, id])?;
+        }
+        Ok(())
+    }
+
+    /// 删除标签，同时清掉所有打标关系（不留孤儿行）。
+    pub fn delete_tag(&self, id: i64) -> AppResult<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM message_tags WHERE tag_id = ?1", params![id])?;
+        tx.execute("DELETE FROM tags WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 给一封邮件打标。已打过则静默忽略（幂等），便于前端做开关式调用。
+    pub fn attach_tag(&self, message_id: i64, tag_id: i64, created_at: &str) -> AppResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO message_tags (message_id, tag_id, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (message_id, tag_id) DO NOTHING",
+            params![message_id, tag_id, created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn detach_tag(&self, message_id: i64, tag_id: i64) -> AppResult<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM message_tags WHERE message_id = ?1 AND tag_id = ?2",
+            params![message_id, tag_id],
+        )?;
+        Ok(())
+    }
+
+    /// 一次给多封邮件打同一个标签（供列表多选使用）。
+    pub fn attach_tag_to_messages(
+        &self,
+        message_ids: &[i64],
+        tag_id: i64,
+        created_at: &str,
+    ) -> AppResult<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut changed = 0usize;
+        for mid in message_ids {
+            changed += tx.execute(
+                "INSERT INTO message_tags (message_id, tag_id, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (message_id, tag_id) DO NOTHING",
+                params![mid, tag_id, created_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    pub fn detach_tag_from_messages(&self, message_ids: &[i64], tag_id: i64) -> AppResult<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut changed = 0usize;
+        for mid in message_ids {
+            changed += tx.execute(
+                "DELETE FROM message_tags WHERE message_id = ?1 AND tag_id = ?2",
+                params![mid, tag_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// 单封邮件的标签 id 集合。
+    pub fn tags_of_message(&self, message_id: i64) -> AppResult<Vec<i64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT tag_id FROM message_tags WHERE message_id = ?1 ORDER BY tag_id ASC",
+        )?;
+        let rows = stmt.query_map(params![message_id], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 删除账号时连带清理其标签与打标关系。
+    pub fn delete_account_tags(&self, account_id: &str) -> AppResult<()> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM message_tags WHERE tag_id IN (SELECT id FROM tags WHERE account_id = ?1)",
+            params![account_id],
+        )?;
+        tx.execute("DELETE FROM tags WHERE account_id = ?1", params![account_id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -602,6 +924,9 @@ fn row_to_header(row: &Row) -> rusqlite::Result<MessageHeader> {
         has_attachments: row.get::<_, i64>("has_attachments")? != 0,
         body_loaded: row.get::<_, i64>("body_loaded")? != 0,
         snippet: row.get("snippet")?,
+        // 标签由 attach_tags 统一回填：查询该行的 SQL 不 JOIN 标签表，
+        // 避免一封邮件带多个标签时把结果集撑成笛卡尔积。
+        tag_ids: Vec::new(),
     })
 }
 

@@ -163,10 +163,15 @@ pub fn list_messages(
     folder: String,
     limit: u32,
     offset: u32,
+    tag_id: Option<i64>,
 ) -> AppResult<Vec<MessageHeader>> {
-    state
-        .store
-        .list_messages(&account_id, &folder, limit.clamp(1, 500), offset)
+    state.store.list_messages_filtered(
+        &account_id,
+        &folder,
+        limit.clamp(1, 500),
+        offset,
+        tag_id,
+    )
 }
 
 /// 读取邮件详情；正文未缓存时按需从服务器拉取并落库。
@@ -341,6 +346,65 @@ pub async fn delete_messages(state: State<'_, AppState>, ids: Vec<i64>) -> AppRe
         remote_error: remote_error.unwrap_or_default(),
     })
 }
+
+// ---------------------------------------------------------------------
+// 标签
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>, account_id: String) -> AppResult<Vec<Tag>> {
+    state.store.list_tags(&account_id)
+}
+
+#[tauri::command]
+pub fn create_tag(
+    state: State<'_, AppState>,
+    account_id: String,
+    name: String,
+    color: Option<String>,
+) -> AppResult<Tag> {
+    let color = color.unwrap_or_else(|| DEFAULT_TAG_COLOR.to_string());
+    state
+        .store
+        .create_tag(&account_id, &name, &color, &Utc::now().to_rfc3339())
+}
+
+#[tauri::command]
+pub fn update_tag(
+    state: State<'_, AppState>,
+    id: i64,
+    name: Option<String>,
+    color: Option<String>,
+) -> AppResult<()> {
+    state.store.update_tag(id, name.as_deref(), color.as_deref())
+}
+
+#[tauri::command]
+pub fn delete_tag(state: State<'_, AppState>, id: i64) -> AppResult<()> {
+    state.store.delete_tag(id)
+}
+
+/// 给单封邮件打 / 取消标签。`attached` 为 true 时打标，false 时撤销。
+///
+/// 幂等：重复打标或撤销不存在的打标都不报错，前端可放心做开关。
+#[tauri::command]
+pub fn tag_message(
+    state: State<'_, AppState>,
+    message_id: i64,
+    tag_id: i64,
+    attached: bool,
+) -> AppResult<()> {
+    if attached {
+        state
+            .store
+            .attach_tag(message_id, tag_id, &Utc::now().to_rfc3339())
+    } else {
+        state.store.detach_tag(message_id, tag_id)
+    }
+}
+
+/// 单个标签的默认色板，与前端保持一致，避免新建后颜色随机跳变。
+const DEFAULT_TAG_COLOR: &str = "#6366f1";
 
 // ---------------------------------------------------------------------
 // 发送

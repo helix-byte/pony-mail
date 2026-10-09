@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { computed, reactive, ref } from "vue";
 
 import { api, errorText } from "../api";
-import type { Account, MessageDetail, MessageHeader, Summary } from "../api/types";
+import type { Account, MessageDetail, MessageHeader, Summary, Tag } from "../api/types";
 import { formatDateTime } from "../utils/format";
 
 export type ToastKind = "info" | "ok" | "error";
@@ -37,6 +37,11 @@ export const useMailStore = defineStore("mail", () => {
   const summaryLoading = ref(false);
   const summaryError = ref("");
 
+  // ---- 标签 ----
+  const tags = ref<Tag[]>([]);
+  /** 当前生效的标签筛选；null 表示看全部。 */
+  const activeTagId = ref<number | null>(null);
+
   // ---- UI ----
   const ui = reactive({
     composeOpen: false,
@@ -57,6 +62,9 @@ export const useMailStore = defineStore("mail", () => {
     () => accounts.value.find((a) => a.id === activeAccountId.value) ?? null,
   );
   const unreadCount = computed(() => messages.value.filter((m) => !m.seen).length);
+  const activeTag = computed(
+    () => tags.value.find((t) => t.id === activeTagId.value) ?? null,
+  );
 
   function toast(text: string, kind: ToastKind = "info") {
     const id = ++toastSeq;
@@ -83,6 +91,8 @@ export const useMailStore = defineStore("mail", () => {
         messages.value = [];
         detail.value = null;
         activeMessageId.value = null;
+        tags.value = [];
+        activeTagId.value = null;
       }
       if (!activeAccountId.value && accounts.value.length > 0) {
         await selectAccount(accounts.value[0].id);
@@ -97,8 +107,12 @@ export const useMailStore = defineStore("mail", () => {
   async function selectAccount(id: string) {
     if (activeAccountId.value === id) return;
     activeAccountId.value = id;
+    // 标签按账号隔离，切账号必须清掉上一个账号的标签与筛选，
+    // 否则会拿 A 账号的 tagId 去筛 B 账号的邮件。
+    tags.value = [];
+    activeTagId.value = null;
     resetReader();
-    await loadMessages();
+    await Promise.all([loadMessages(), loadTags()]);
   }
 
   async function removeAccount(id: string) {
@@ -120,14 +134,151 @@ export const useMailStore = defineStore("mail", () => {
       messages.value = [];
       return;
     }
+    const accountId = activeAccountId.value;
+    const tagId = activeTagId.value;
     busy.messages = true;
     try {
-      messages.value = await api.listMessages(activeAccountId.value);
+      const list = await api.listMessages(accountId, "INBOX", 200, 0, tagId);
+      // 竞态保护：等待期间用户可能已切账号或切了筛选，旧结果不能覆盖新结果。
+      if (activeAccountId.value !== accountId || activeTagId.value !== tagId) return;
+      messages.value = list;
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
       busy.messages = false;
     }
+  }
+
+  /** 切换标签筛选：null 看全部，否则只看该标签下的邮件。 */
+  async function selectTag(id: number | null) {
+    if (activeTagId.value === id) return;
+    activeTagId.value = id;
+    resetReader();
+    await loadMessages();
+  }
+
+  // ------------------------------------------------------------------
+  // 标签
+  // ------------------------------------------------------------------
+
+  async function loadTags() {
+    if (!activeAccountId.value) {
+      tags.value = [];
+      return;
+    }
+    const accountId = activeAccountId.value;
+    try {
+      const list = await api.listTags(accountId);
+      if (activeAccountId.value !== accountId) return;
+      tags.value = list;
+      // 筛选中的标签被别处删掉了 → 退回「全部」，避免停在一个空结果页。
+      if (activeTagId.value !== null && !list.some((t) => t.id === activeTagId.value)) {
+        activeTagId.value = null;
+        void loadMessages();
+      }
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+  }
+
+  async function createTag(name: string, color: string): Promise<boolean> {
+    if (!activeAccountId.value) {
+      toast("请先添加一个邮箱账号", "info");
+      return false;
+    }
+    try {
+      await api.createTag(activeAccountId.value, name, color);
+      await loadTags();
+      toast(`已创建标签「${name.trim()}」`, "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  async function updateTag(id: number, patch: { name?: string; color?: string }) {
+    try {
+      await api.updateTag(id, patch);
+      await loadTags();
+      toast("标签已更新", "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  async function deleteTag(id: number) {
+    try {
+      await api.deleteTag(id);
+      // 本地先摘掉，避免侧栏在重新拉取前短暂闪回旧标签。
+      tags.value = tags.value.filter((t) => t.id !== id);
+      // 邮件上的标签点也要同步摘掉，否则会留下「幽灵标签」。
+      for (const m of messages.value) {
+        m.tagIds = m.tagIds.filter((tid) => tid !== id);
+      }
+      if (detail.value) {
+        detail.value.header.tagIds = detail.value.header.tagIds.filter((tid) => tid !== id);
+      }
+      if (activeTagId.value === id) {
+        activeTagId.value = null;
+        await loadMessages();
+      }
+      toast("标签已删除", "ok");
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  }
+
+  /** 给一封邮件切换某个标签的挂载状态。 */
+  async function toggleMessageTag(messageId: number, tagId: number) {
+    const header =
+      messages.value.find((m) => m.id === messageId) ??
+      (detail.value?.header.id === messageId ? detail.value.header : undefined);
+    const attached = header?.tagIds.includes(tagId) ?? false;
+    const next = !attached;
+
+    // 乐观更新：打标是纯本地写，回滚成本低，等往返会让点击有明显延迟。
+    applyTagLocally(messageId, tagId, next);
+    try {
+      await api.tagMessage(messageId, tagId, next);
+      await loadTags(); // 刷新角标计数
+    } catch (e) {
+      applyTagLocally(messageId, tagId, attached); // 回滚
+      toast(errorText(e), "error");
+      return;
+    }
+
+    // 正在按标签筛选且刚把这封邮件从该标签下摘掉 → 它应立即从列表消失。
+    if (activeTagId.value === tagId && !next) {
+      await loadMessages();
+    }
+  }
+
+  function applyTagLocally(messageId: number, tagId: number, attached: boolean) {
+    for (const target of [messages.value, detail.value ? [detail.value.header] : []]) {
+      const m = target.find((h) => h.id === messageId);
+      if (!m) continue;
+      if (attached) {
+        if (!m.tagIds.includes(tagId)) m.tagIds = [...m.tagIds, tagId].sort((a, b) => a - b);
+      } else {
+        m.tagIds = m.tagIds.filter((tid) => tid !== tagId);
+      }
+    }
+  }
+
+  /** 取某封邮件当前挂载的标签对象列表（列表 / 阅读区渲染用）。 */
+  function tagsOf(messageId: number): Tag[] {
+    const header =
+      messages.value.find((m) => m.id === messageId) ??
+      (detail.value?.header.id === messageId ? detail.value.header : undefined);
+    if (!header) return [];
+    return header.tagIds
+      .map((id) => tags.value.find((t) => t.id === id))
+      .filter((t): t is Tag => t !== undefined);
   }
 
   async function sync() {
@@ -410,16 +561,26 @@ export const useMailStore = defineStore("mail", () => {
     summary,
     summaryLoading,
     summaryError,
+    tags,
+    activeTagId,
     ui,
     busy,
     toasts,
     activeAccount,
+    activeTag,
     unreadCount,
     toast,
     loadAccounts,
     selectAccount,
     removeAccount,
     loadMessages,
+    selectTag,
+    loadTags,
+    createTag,
+    updateTag,
+    deleteTag,
+    toggleMessageTag,
+    tagsOf,
     sync,
     resetReader,
     openMessage,

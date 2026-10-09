@@ -40,6 +40,19 @@ export interface MessageHeader {
   hasAttachments: boolean;
   bodyLoaded: boolean;
   snippet: string;
+  /** 该邮件携带的标签 id。列表接口直接返回，无需逐封再查。 */
+  tagIds: number[];
+}
+
+/** 用户自定义标签（按账号隔离）。 */
+export interface Tag {
+  id: number;
+  accountId: string;
+  name: string;
+  color: string;
+  sortOrder: number;
+  /** 已打标邮件数，用于侧栏角标。 */
+  messageCount: number;
 }
 
 export interface AttachmentMeta {

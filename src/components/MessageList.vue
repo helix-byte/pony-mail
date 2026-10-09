@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive } from "vue";
 
 import { useMailStore } from "../stores/mail";
-import { avatarColor, avatarText, formatDate } from "../utils/format";
+import { avatarColor, avatarText, formatDate, tagDotStyle } from "../utils/format";
 
 const store = useMailStore();
 
@@ -378,30 +378,12 @@ onBeforeUnmount(() => {
             class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-zinc-300 transition hover:bg-hover"
             @click="menu.messageId !== null && onMenuToggleTag(t.id)"
           >
+            <!-- 圆点即勾选态：常态低透明度，已打该标签时发出同色辉光 -->
             <span
-              class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
-              :class="
-                menu.messageId !== null && hasTag(menu.messageId, t.id)
-                  ? 'border-transparent text-white'
-                  : 'border-zinc-600'
-              "
+              class="h-3 w-3 shrink-0 rounded-full transition"
               :style="
-                menu.messageId !== null && hasTag(menu.messageId, t.id)
-                  ? { background: t.color }
-                  : {}
+                tagDotStyle(t.color, menu.messageId !== null && hasTag(menu.messageId, t.id))
               "
-            >
-              <svg
-                v-if="menu.messageId !== null && hasTag(menu.messageId, t.id)"
-                class="h-2.5 w-2.5"
-                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
-              >
-                <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </span>
-            <span
-              class="h-2.5 w-2.5 shrink-0 rounded-full"
-              :style="{ background: t.color }"
             />
             <span class="min-w-0 flex-1 truncate">{{ t.name }}</span>
             <span class="shrink-0 text-[10.5px] text-zinc-600">{{ t.messageCount }}</span>

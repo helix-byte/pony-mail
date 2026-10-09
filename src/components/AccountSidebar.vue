@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 
 import { useMailStore } from "../stores/mail";
-import { avatarColor, avatarText, GROUP_PALETTE, TAG_PALETTE } from "../utils/format";
+import { avatarColor, avatarText, GROUP_PALETTE, TAG_PALETTE, tagDotStyle } from "../utils/format";
 
 const store = useMailStore();
 
@@ -363,24 +363,11 @@ const ungroupedTags = computed(() => {
                   "
                   @click="store.toggleTagFilter(t!.id)"
                 >
-                  <!-- 勾选框：多选状态一目了然 -->
+                  <!-- 彩色圆点：常态以标签本色低透明度示人，选中时发出同色辉光 -->
                   <span
-                    class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
-                    :class="
-                      store.activeTagIds.includes(t!.id)
-                        ? 'border-transparent text-white'
-                        : 'border-zinc-600'
-                    "
-                    :style="store.activeTagIds.includes(t!.id) ? { background: t!.color } : {}"
-                  >
-                    <svg
-                      v-if="store.activeTagIds.includes(t!.id)"
-                      class="h-2.5 w-2.5"
-                      viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
-                    >
-                      <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
-                    </svg>
-                  </span>
+                    class="h-3 w-3 shrink-0 rounded-full transition"
+                    :style="tagDotStyle(t!.color, store.activeTagIds.includes(t!.id))"
+                  />
                   <span class="min-w-0 flex-1 truncate text-left">{{ t!.name }}</span>
                   <span
                     v-if="t!.messageCount > 0"
@@ -423,23 +410,11 @@ const ungroupedTags = computed(() => {
                 "
                 @click="store.toggleTagFilter(t.id)"
               >
+                <!-- 彩色圆点：同组内标签一致的选中语言 -->
                 <span
-                  class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
-                  :class="
-                    store.activeTagIds.includes(t.id)
-                      ? 'border-transparent text-white'
-                      : 'border-zinc-600'
-                  "
-                  :style="store.activeTagIds.includes(t.id) ? { background: t.color } : {}"
-                >
-                  <svg
-                    v-if="store.activeTagIds.includes(t.id)"
-                    class="h-2.5 w-2.5"
-                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
-                  >
-                    <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </span>
+                  class="h-3 w-3 shrink-0 rounded-full transition"
+                  :style="tagDotStyle(t.color, store.activeTagIds.includes(t.id))"
+                />
                 <span class="min-w-0 flex-1 truncate text-left">{{ t.name }}</span>
                 <span
                   v-if="t.messageCount > 0"
@@ -618,24 +593,11 @@ const ungroupedTags = computed(() => {
                 class="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[12.5px] transition hover:bg-panel-2"
                 @click="toggleDraftTag(t.id)"
               >
+                <!-- 圆点即勾选态：原「复选框 + 色点」两件套合并为一个发光圆点 -->
                 <span
-                  class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border transition"
-                  :class="
-                    groupDraftTagIds.includes(t.id)
-                      ? 'border-transparent text-white'
-                      : 'border-zinc-600'
-                  "
-                  :style="groupDraftTagIds.includes(t.id) ? { background: t.color } : {}"
-                >
-                  <svg
-                    v-if="groupDraftTagIds.includes(t.id)"
-                    class="h-2.5 w-2.5"
-                    viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5"
-                  >
-                    <path d="M5 13l4 4L19 7" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </span>
-                <span class="h-2.5 w-2.5 shrink-0 rounded-full" :style="{ background: t.color }" />
+                  class="h-3 w-3 shrink-0 rounded-full transition"
+                  :style="tagDotStyle(t.color, groupDraftTagIds.includes(t.id))"
+                />
                 <span class="min-w-0 flex-1 truncate text-zinc-300">{{ t.name }}</span>
                 <span
                   v-if="store.groupsOfTag(t.id).length"

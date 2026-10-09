@@ -1,0 +1,179 @@
+use serde::{Deserialize, Serialize};
+
+fn default_true() -> bool {
+    true
+}
+
+/// 邮箱账号（不含密码）。密码只存在于系统凭据管理器中。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Account {
+    pub id: String,
+    pub email: String,
+    pub display_name: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    pub imap_tls: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_tls: bool,
+    pub username: String,
+    pub created_at: String,
+}
+
+/// 新增账号 / 测试连接入参（含明文密码，仅内存传递，不落库）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInput {
+    pub email: String,
+    #[serde(default)]
+    pub display_name: String,
+    pub imap_host: String,
+    pub imap_port: u16,
+    #[serde(default = "default_true")]
+    pub imap_tls: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    #[serde(default = "default_true")]
+    pub smtp_tls: bool,
+    pub username: String,
+    pub password: String,
+}
+
+/// 邮件列表项（不含正文，列表渲染用）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageHeader {
+    pub id: i64,
+    pub uid: u32,
+    pub folder: String,
+    pub subject: String,
+    pub from_name: String,
+    pub from_addr: String,
+    pub date_ts: i64,
+    pub seen: bool,
+    pub flagged: bool,
+    pub has_attachments: bool,
+    pub body_loaded: bool,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentMeta {
+    pub filename: String,
+    pub mime: String,
+    pub size: usize,
+}
+
+/// 邮件详情（含正文）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageDetail {
+    pub header: MessageHeader,
+    pub to_addrs: String,
+    pub cc_addrs: String,
+    pub message_id: String,
+    pub body_text: String,
+    pub body_html: String,
+    pub attachments: Vec<AttachmentMeta>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncReport {
+    pub folder: String,
+    pub fetched: usize,
+    pub inserted: usize,
+    pub total_on_server: usize,
+}
+
+/// 删除邮件的结果。区分「服务器已删」与「仅删了本地缓存」两种情况，
+/// 便于前端如实告知用户，而不是笼统提示「已删除」。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteReport {
+    /// 实际从本地缓存中移除的条数。
+    pub deleted_local: usize,
+    /// 是否已在服务器上永久删除。服务器删除失败时为 false（仅有本地生效）。
+    pub deleted_remote: bool,
+    /// 服务器删除失败时的原因；成功或未尝试服务器删除时为空串。
+    pub remote_error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestReport {
+    pub imap_ok: bool,
+    pub smtp_ok: bool,
+    pub imap_message: String,
+    pub smtp_message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub text: String,
+    pub model: String,
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiStatus {
+    pub online: bool,
+    pub models: Vec<String>,
+    pub base_url: String,
+    pub model: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSettings {
+    pub base_url: String,
+    pub model: String,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            base_url: "http://localhost:11434".to_string(),
+            // 选一个体积适中、中文摘要稳定的通用模型。用户可在「AI 设置」中改；
+            // 若本机未安装，生成摘要时会自动回退到第一个可用模型。
+            model: "qwen3.5:9b".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendPayload {
+    pub account_id: String,
+    pub to: String,
+    #[serde(default)]
+    pub cc: String,
+    pub subject: String,
+    pub body: String,
+    #[serde(default)]
+    pub html: bool,
+}
+
+/// 一封已解析的邮件（解析层输出，落库前使用）。
+#[derive(Debug, Clone, Default)]
+pub struct ParsedMail {
+    pub uid: u32,
+    pub message_id: String,
+    pub subject: String,
+    pub from_name: String,
+    pub from_addr: String,
+    pub to_addrs: String,
+    pub cc_addrs: String,
+    pub date_ts: i64,
+    pub seen: bool,
+    pub flagged: bool,
+    pub body_text: String,
+    pub body_html: String,
+    pub attachments: Vec<AttachmentMeta>,
+    pub has_body: bool,
+}

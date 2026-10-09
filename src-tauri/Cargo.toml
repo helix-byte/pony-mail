@@ -1,0 +1,70 @@
+[package]
+name = "pony-mail"
+version = "0.1.0"
+description = "Pony Mail - AI powered desktop email client"
+authors = ["Skyline"]
+edition = "2021"
+
+[lib]
+name = "pony_mail_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# tauri-build → schemars 0.8 → indexmap 1.x。indexmap 1.9 用 `#[cfg(has_std)]`
+# 决定 IndexMap 是否带默认类型参数，而该 cfg 由 build script 探测得出。
+# resolver v2 下 build-dependencies 与普通依赖的 feature 独立解析，
+# 所以这里必须再显式启用一次 std，否则 schemars 会报 E0107。
+indexmap = { version = "1.9", features = ["std"] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ---- 邮件协议层 ----
+# imap 走本地 vendored 补丁（见 vendor/imap）：上游 2.4.1 无法发送 RFC 2971 ID 命令，
+# 且 read_response_onto 对非本命令 tag 的响应会 assert 崩溃，导致网易系邮箱无法收信。
+imap = { path = "vendor/imap" }
+native-tls = "0.2"
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "native-tls",
+    "builder",
+    "hostname",
+] }
+mail-parser = "0.11"
+
+# ---- 本地存储与凭据 ----
+rusqlite = { version = "0.40", features = ["bundled"] }
+keyring = { version = "3", features = ["windows-native"] }
+
+# ---- AI 推理（Ollama 及 OpenAI 兼容端点）----
+reqwest = { version = "0.13", features = ["json"] }
+
+# ---- 通用工具 ----
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+# 说明：tauri-build → schemars 0.8 依赖 indexmap 1.x，而 indexmap 1.9 用
+# `#[cfg(has_std)]` 决定 IndexMap 是否有默认类型参数。这里显式启用 std feature，
+# 避免 has_std 未设置时 schemars 编译失败（E0107）。
+indexmap = { version = "1.9", features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+
+[dev-dependencies]
+# 集成测试用临时目录（tests/delete_message.rs 要建一次性 SQLite 库）。
+tempfile = "3"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,0 +1,31 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# 本地安装失败的依赖残留（历史上 npm/pnpm 中断留下的目录，不入库）
+node_modules_broken/
+node_modules_pnpm_broken/
+
+# WorkBuddy 工作区元数据（含本地会话记忆，不入库）
+.workbuddy/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

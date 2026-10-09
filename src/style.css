@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  --color-shell: #08090d;
+  --color-panel: #0f1117;
+  --color-panel-2: #151824;
+  --color-hover: #1c2030;
+  --color-line: #242938;
+  --color-accent: #6366f1;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-shell);
+  color: #e4e4e7;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* 细滚动条，贴合深色界面 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #333a4d transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #333a4d;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: #47506b;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 邮件正文容器（沙箱 iframe 内由邮件自带样式控制） */
+.mail-frame {
+  width: 100%;
+  border: 0;
+  background: #ffffff;
+  border-radius: 10px;
+}
+
+/* 摘要文本保留换行 */
+.summary-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.75;
+}

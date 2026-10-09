@@ -5,120 +5,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::schema;
 
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS accounts (
-    id            TEXT PRIMARY KEY,
-    email         TEXT NOT NULL UNIQUE,
-    display_name  TEXT NOT NULL DEFAULT '',
-    imap_host     TEXT NOT NULL,
-    imap_port     INTEGER NOT NULL,
-    imap_tls      INTEGER NOT NULL DEFAULT 1,
-    smtp_host     TEXT NOT NULL,
-    smtp_port     INTEGER NOT NULL,
-    smtp_tls      INTEGER NOT NULL DEFAULT 1,
-    username      TEXT NOT NULL,
-    created_at    TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS folders (
-    account_id  TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    messages    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (account_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id       TEXT NOT NULL,
-    folder           TEXT NOT NULL,
-    uid              INTEGER NOT NULL,
-    message_id       TEXT NOT NULL DEFAULT '',
-    subject          TEXT NOT NULL DEFAULT '',
-    from_name        TEXT NOT NULL DEFAULT '',
-    from_addr        TEXT NOT NULL DEFAULT '',
-    to_addrs         TEXT NOT NULL DEFAULT '',
-    cc_addrs         TEXT NOT NULL DEFAULT '',
-    date_ts          INTEGER NOT NULL DEFAULT 0,
-    seen             INTEGER NOT NULL DEFAULT 0,
-    flagged          INTEGER NOT NULL DEFAULT 0,
-    has_attachments  INTEGER NOT NULL DEFAULT 0,
-    body_loaded      INTEGER NOT NULL DEFAULT 0,
-    snippet          TEXT NOT NULL DEFAULT '',
-    body_text        TEXT NOT NULL DEFAULT '',
-    body_html        TEXT NOT NULL DEFAULT '',
-    attachments      TEXT NOT NULL DEFAULT '[]',
-    synced_at        TEXT NOT NULL DEFAULT '',
-    UNIQUE (account_id, folder, uid)
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_list
-    ON messages (account_id, folder, date_ts DESC);
-
-CREATE TABLE IF NOT EXISTS sync_state (
-    account_id   TEXT NOT NULL,
-    folder       TEXT NOT NULL,
-    last_uid     INTEGER NOT NULL DEFAULT 0,
-    last_sync_at TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (account_id, folder)
-);
-
-CREATE TABLE IF NOT EXISTS ai_cache (
-    cache_key   TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,
-    model       TEXT NOT NULL DEFAULT '',
-    content     TEXT NOT NULL,
-    created_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS tags (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id  TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    color       TEXT NOT NULL DEFAULT '#6366f1',
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL DEFAULT '',
-    UNIQUE (account_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS message_tags (
-    message_id  INTEGER NOT NULL,
-    tag_id      INTEGER NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (message_id, tag_id)
-);
-
--- 按标签筛邮件时走这个索引；反过来查「某封邮件的标签」走主键前缀。
-CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags (tag_id, message_id);
-
--- 标签组：可点击筛选的标签合集，组内标签是 OR 关系。
-CREATE TABLE IF NOT EXISTS tag_groups (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_id  TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    color       TEXT NOT NULL DEFAULT '#8b5cf6',
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    collapsed   INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL DEFAULT '',
-    UNIQUE (account_id, name)
-);
-
--- 组与标签**多对多**：同一标签可同时归入多个组（如「工作」既在「本周」也在「客户」组）。
-CREATE TABLE IF NOT EXISTS tag_group_members (
-    group_id    INTEGER NOT NULL,
-    tag_id      INTEGER NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (group_id, tag_id)
-);
-
--- 按组查其成员标签（渲染侧栏折叠区）时走这个索引。
-CREATE INDEX IF NOT EXISTS idx_tag_group_members_tag ON tag_group_members (tag_id, group_id);
-"#;
 
 /// SQLite 仓储层。每次操作独立开连接（SQLite 打开成本极低），
 /// 避免跨线程共享 `Connection` 带来的锁竞争。
@@ -132,7 +20,8 @@ impl Store {
         let store = Self { path };
         {
             let conn = store.conn()?;
-            conn.execute_batch(SCHEMA)?;
+            // 建表与版本化迁移统一由 schema 模块负责（含存量库的版本补齐）。
+            schema::apply(&conn)?;
         }
         Ok(store)
     }
@@ -694,7 +583,7 @@ impl Store {
     pub fn list_tags(&self, account_id: &str) -> AppResult<Vec<Tag>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT t.id, t.account_id, t.name, t.color, t.sort_order,
+            "SELECT t.id, t.account_id, t.name, t.color, t.sort_order, t.created_by,
                     COUNT(mt.message_id) AS message_count
              FROM tags t
              LEFT JOIN message_tags mt ON mt.tag_id = t.id
@@ -710,6 +599,7 @@ impl Store {
                 color: row.get("color")?,
                 sort_order: row.get("sort_order")?,
                 message_count: row.get("message_count")?,
+                created_by: row.get("created_by")?,
             })
         })?;
         let mut out = Vec::new();
@@ -768,6 +658,8 @@ impl Store {
             color: color.to_string(),
             sort_order: next_order,
             message_count: 0,
+            // 手动创建的标签一律归 user；AI 整理创建走独立入口（classify 写回事务）。
+            created_by: "user".to_string(),
         })
     }
 
@@ -919,7 +811,7 @@ impl Store {
     pub fn list_tag_groups(&self, account_id: &str) -> AppResult<Vec<TagGroup>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, name, color, sort_order, collapsed
+            "SELECT id, account_id, name, color, sort_order, collapsed, ai_mode
              FROM tag_groups
              WHERE account_id = ?1
              ORDER BY sort_order ASC, id ASC",
@@ -935,6 +827,7 @@ impl Store {
                 tag_ids: Vec::new(),
                 message_count: 0,
                 raw_message_count: 0,
+                ai_mode: row.get("ai_mode")?,
             })
         })?;
         let mut out = Vec::new();
@@ -1081,6 +974,8 @@ impl Store {
             tag_ids: Vec::new(),
             message_count: 0,
             raw_message_count: 0,
+            // 新组默认不参与 AI 整理，由用户在组编辑器里显式开启。
+            ai_mode: "off".to_string(),
         })
     }
 
@@ -1090,8 +985,14 @@ impl Store {
         name: Option<&str>,
         color: Option<&str>,
         collapsed: Option<bool>,
+        ai_mode: Option<&str>,
     ) -> AppResult<()> {
         let conn = self.conn()?;
+        if let Some(raw) = ai_mode {
+            if !matches!(raw, "off" | "select" | "create") {
+                return Err(AppError::Other(format!("无效的 AI 整理模式：{raw}")));
+            }
+        }
         if let Some(raw) = name {
             let name = raw.trim();
             if name.is_empty() {
@@ -1127,6 +1028,12 @@ impl Store {
             conn.execute(
                 "UPDATE tag_groups SET collapsed = ?1 WHERE id = ?2",
                 params![collapsed as i64, id],
+            )?;
+        }
+        if let Some(ai_mode) = ai_mode {
+            conn.execute(
+                "UPDATE tag_groups SET ai_mode = ?1 WHERE id = ?2",
+                params![ai_mode, id],
             )?;
         }
         Ok(())

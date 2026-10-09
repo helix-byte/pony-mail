@@ -454,10 +454,15 @@ pub fn update_tag_group(
     name: Option<String>,
     color: Option<String>,
     collapsed: Option<bool>,
+    ai_mode: Option<String>,
 ) -> AppResult<()> {
-    state
-        .store
-        .update_tag_group(id, name.as_deref(), color.as_deref(), collapsed)
+    state.store.update_tag_group(
+        id,
+        name.as_deref(),
+        color.as_deref(),
+        collapsed,
+        ai_mode.as_deref(),
+    )
 }
 
 #[tauri::command]

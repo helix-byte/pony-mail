@@ -1,6 +1,8 @@
 /// 对集成测试可见（tests/ 下需要直接驱动 IMAP 会话）。
 pub mod mail;
 pub mod models;
+/// 对集成测试可见（tests/ 下需要驱动迁移机制与 AI 整理数据层）。
+pub mod schema;
 /// 对集成测试可见（tests/ 下需要直接驱动删除等数据层逻辑）。
 pub mod store;
 mod ai;

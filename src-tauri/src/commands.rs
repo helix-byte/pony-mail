@@ -1,12 +1,19 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use chrono::Utc;
+use serde::Serialize;
+use tauri::ipc::Channel;
 use tauri::State;
 use uuid::Uuid;
 
 use crate::ai;
+use crate::classify::{self, Pick, SENDER_SKIP_MIN_SAMPLES};
 use crate::credentials;
 use crate::error::{AppError, AppResult};
 use crate::mail::{imap_client, smtp_client};
 use crate::models::*;
+use crate::store::GroupAssignment;
 use crate::AppState;
 
 // ---------------------------------------------------------------------
@@ -592,6 +599,255 @@ pub fn get_cached_summary(state: State<'_, AppState>, id: i64) -> AppResult<Opti
 /// 带上 Message-ID 是为了覆盖「同一账号同一 UID 位置换了新邮件」的情况。
 fn summary_cache_key(id: i64, message_id: &str, model: &str) -> String {
     format!("summary:{id}:{message_id}:{model}")
+}
+
+// ---------------------------------------------------------------------
+// 智能整理
+// ---------------------------------------------------------------------
+
+/// 单批整理的邮件数上限。单封推理 6~16 秒（本机 9b 实测），快速通道会显著
+/// 缩短实际耗时；剩余邮件由下一次整理续跑（队列即「未整理」）。
+const CLASSIFY_BATCH_LIMIT: i64 = 50;
+/// 连续失败熔断阈值：模型/解析连续失败这么多封即中止（写库失败不计入）。
+const MAX_CONSECUTIVE_FAILURES: usize = 3;
+
+/// 批量整理的事件流（Tauri Channel 点对点推送，前端逐封更新界面）。
+#[derive(Clone, Serialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "event",
+    content = "data"
+)]
+pub enum ClassifyEvent {
+    Start {
+        total: usize,
+    },
+    Item {
+        message_id: i64,
+        tag_ids: Vec<i64>,
+        skipped: bool,
+        error: Option<String>,
+    },
+    Done {
+        classified: usize,
+        failed: usize,
+        skipped: usize,
+        remaining: i64,
+        cancelled: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// 批量智能整理：把未整理的邮件逐个交给本地模型，逐封推送进度。
+///
+/// 手动按钮与「同步后自动整理」共用本命令；按账户做并发去重。
+#[tauri::command]
+pub async fn classify_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    on_event: Channel<ClassifyEvent>,
+) -> AppResult<()> {
+    {
+        let mut running = state.classifying.lock().expect("classifying 锁中毒");
+        if !running.insert(account_id.clone()) {
+            return Err(AppError::Other("该账户正在整理中，请稍候".to_string()));
+        }
+    }
+    let result = run_classify(&state, &account_id, &on_event).await;
+    state
+        .classifying
+        .lock()
+        .expect("classifying 锁中毒")
+        .remove(&account_id);
+    state
+        .cancel_flags
+        .lock()
+        .expect("cancel_flags 锁中毒")
+        .remove(&account_id);
+    result
+}
+
+/// 请求中止正在进行的整理（在消息边界生效；已写回的结果保留）。
+#[tauri::command]
+pub fn cancel_classify(state: State<'_, AppState>, account_id: String) -> AppResult<()> {
+    if let Some(flag) = state
+        .cancel_flags
+        .lock()
+        .expect("cancel_flags 锁中毒")
+        .get(&account_id)
+    {
+        flag.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+async fn run_classify(
+    state: &AppState,
+    account_id: &str,
+    on_event: &Channel<ClassifyEvent>,
+) -> AppResult<()> {
+    // 维度组快照：此后用户改组只影响下一轮。
+    let groups = state.store.ai_dimension_groups(account_id)?;
+    if groups.is_empty() {
+        return Err(AppError::Other(
+            "还没有开启 AI 整理的标签组。请先在左侧标签组的编辑里选择一种「AI 整理」模式。"
+                .to_string(),
+        ));
+    }
+
+    // 取消标志（cancel_classify 置位；结束时由 classify_messages 统一清理）。
+    let cancel = Arc::new(AtomicBool::new(false));
+    state
+        .cancel_flags
+        .lock()
+        .expect("cancel_flags 锁中毒")
+        .insert(account_id.to_string(), cancel.clone());
+
+    let settings = state.store.ai_settings()?;
+    // `now` 供模型判断时限；`stamp` 是写库用的时间戳。
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let stamp = Utc::now().to_rfc3339();
+    let group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+
+    let ids = state.store.unclassified_ids(account_id, CLASSIFY_BATCH_LIMIT)?;
+    let _ = on_event.send(ClassifyEvent::Start { total: ids.len() });
+
+    let mut classified = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut consecutive = 0usize;
+    let mut cancelled = false;
+
+    for id in ids {
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            break;
+        }
+
+        // ---- 读阶段（本地查询，短持有连接）----
+        let input = match state.store.classify_input(id) {
+            Ok(i) => i,
+            // 邮件在整理途中被删：跳过，不计数。
+            Err(_) => continue,
+        };
+        let sample_count = state
+            .store
+            .sender_classified_count(account_id, &input.from_addr, id)?;
+        let mut stats = Vec::with_capacity(groups.len());
+        for g in &groups {
+            stats.push(
+                state
+                    .store
+                    .sender_group_stats(account_id, &input.from_addr, id, g.id)?,
+            );
+        }
+
+        // ---- 推理阶段：快速通道优先，否则调模型 ----
+        // 快速通道：同发件人历史 ≥3 封且各启用组「唯一标签全覆盖或无历史」→ 跳过模型。
+        let consensus = classify::sender_consensus(&stats, sample_count, SENDER_SKIP_MIN_SAMPLES);
+        let via_fastlane = consensus.is_some();
+
+        let outcome: Result<Vec<GroupAssignment>, String> = match consensus {
+            Some(picks) => Ok(groups
+                .iter()
+                .zip(picks)
+                .map(|(g, p)| GroupAssignment {
+                    group_id: g.id,
+                    pick: p.map(Pick::Existing),
+                })
+                .collect()),
+            None => {
+                let hints = classify::sender_hints(&stats, &group_names, sample_count);
+                let system = classify::build_system_prompt(&groups);
+                let user = classify::build_user_prompt(&input, &hints, &now);
+                match ai::run_with_recovery(&state.http, &settings, |model| {
+                    ai::chat_json(&state.http, &settings, model, &system, &user, 512)
+                })
+                .await
+                {
+                    Ok(raw) => classify::parse_classify(&raw, &groups)
+                        .map(|parsed| {
+                            groups
+                                .iter()
+                                .zip(parsed.picks)
+                                .map(|(g, p)| GroupAssignment {
+                                    group_id: g.id,
+                                    pick: p,
+                                })
+                                .collect()
+                        })
+                        .ok_or_else(|| "模型输出无法解析为有效的整理结果".to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+
+        // ---- 写阶段 / 失败处理 ----
+        match outcome {
+            Err(message) => {
+                failed += 1;
+                consecutive += 1;
+                let _ = on_event.send(ClassifyEvent::Item {
+                    message_id: id,
+                    tag_ids: Vec::new(),
+                    skipped: false,
+                    error: Some(message.clone()),
+                });
+                if consecutive >= MAX_CONSECUTIVE_FAILURES {
+                    let _ = on_event.send(ClassifyEvent::Error {
+                        message: format!(
+                            "连续 {MAX_CONSECUTIVE_FAILURES} 封整理失败，已中止。{message}"
+                        ),
+                    });
+                    break;
+                }
+            }
+            Ok(assignments) => {
+                match state
+                    .store
+                    .save_classify_result(account_id, id, &assignments, &stamp)
+                {
+                    Ok(tag_ids) => {
+                        classified += 1;
+                        consecutive = 0;
+                        if via_fastlane {
+                            skipped += 1;
+                        }
+                        let _ = on_event.send(ClassifyEvent::Item {
+                            message_id: id,
+                            tag_ids,
+                            skipped: via_fastlane,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        // 写库失败不是模型问题：计失败但**不**熔断；
+                        // ai_tagged_at 未写，下次整理会自动重试。
+                        failed += 1;
+                        let _ = on_event.send(ClassifyEvent::Item {
+                            message_id: id,
+                            tag_ids: Vec::new(),
+                            skipped: false,
+                            error: Some(format!("写入失败：{e}")),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let remaining = state.store.count_unclassified(account_id).unwrap_or(0);
+    let _ = on_event.send(ClassifyEvent::Done {
+        classified,
+        failed,
+        skipped,
+        remaining,
+        cancelled,
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

@@ -211,17 +211,19 @@ where
 /// 结构化分类请求：`format:"json"` + `think:false` + `temperature:0`。
 ///
 /// 返回模型输出的 JSON 原文（解析与容错由 `classify` 模块负责）。
-/// 与摘要共用 [`run_with_recovery`] 的自愈链路，参数差异只在本函数里。
+/// 与摘要共用 [`run_with_recovery`] 的自愈链路，参数差异只在本函数里；
+/// `model` 按值接收的原因同 [`request_summary`]。
 pub(crate) async fn chat_json(
     client: &reqwest::Client,
     settings: &AiSettings,
+    model: String,
     system: &str,
     user: &str,
     num_predict: i32,
 ) -> AppResult<String> {
     let url = format!("{}/api/chat", base_of(settings));
     let body = ChatRequest {
-        model: settings.model.clone(),
+        model: model.clone(),
         messages: vec![
             ChatMessage {
                 role: "system",
@@ -263,7 +265,7 @@ pub(crate) async fn chat_json(
     }
 
     let parsed: ChatResponse = resp.json().await?;
-    extract_content(parsed, &settings.model)
+    extract_content(parsed, &model)
 }
 
 /// 请求 Ollama 立即卸载指定模型（释放 runner / 显存）。

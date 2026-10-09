@@ -3,10 +3,19 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::classify::{ClassifyInput, DimensionGroup, GroupAiMode, Pick};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::schema;
 
+
+/// 单封邮件对某个启用维度组的指派（[`Store::save_classify_result`] 的入参）。
+#[derive(Debug, Clone)]
+pub struct GroupAssignment {
+    pub group_id: i64,
+    /// `None` = 该维度不指派（低置信 / 模型判空 / 快速通道无共识）。
+    pub pick: Option<Pick>,
+}
 
 /// SQLite 仓储层。每次操作独立开连接（SQLite 打开成本极低），
 /// 避免跨线程共享 `Connection` 带来的锁竞争。
@@ -1151,6 +1160,271 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // 智能整理（AI 分类）
+    // ------------------------------------------------------------------
+
+    /// 读出该账号全部「参与 AI 整理」的维度组（含候选标签，按展示顺序）。
+    ///
+    /// 组数量个位数，逐组查候选即可，无需刻意合并成一条 SQL。
+    pub fn ai_dimension_groups(&self, account_id: &str) -> AppResult<Vec<DimensionGroup>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, ai_mode FROM tag_groups
+             WHERE account_id = ?1 AND ai_mode != 'off'
+             ORDER BY sort_order ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut raw: Vec<(i64, String, String)> = Vec::new();
+        for r in rows {
+            raw.push(r?);
+        }
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(raw.len());
+        for (id, name, mode) in raw {
+            let Some(mode) = GroupAiMode::from_db(&mode) else {
+                continue; // 未知模式视为不参与
+            };
+            let mut stmt = conn.prepare(
+                "SELECT t.id, t.name FROM tags t
+                 JOIN tag_group_members gm ON gm.tag_id = t.id
+                 WHERE gm.group_id = ?1
+                 ORDER BY t.sort_order ASC, t.id ASC",
+            )?;
+            let rows = stmt.query_map(params![id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut candidates = Vec::new();
+            for r in rows {
+                candidates.push(r?);
+            }
+            out.push(DimensionGroup {
+                id,
+                name,
+                mode,
+                candidates,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 待整理队列：尚未整理（`ai_tagged_at IS NULL`）的邮件 id，最新优先。
+    ///
+    /// Pony 目前只在收件箱工作，队列按账号级取（与 Hony 的账户级一致）。
+    pub fn unclassified_ids(&self, account_id: &str, limit: i64) -> AppResult<Vec<i64>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messages
+             WHERE account_id = ?1 AND ai_tagged_at IS NULL
+             ORDER BY date_ts DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![account_id, limit], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 还剩多少封未整理（`Done` 事件里的「剩余」）。
+    pub fn count_unclassified(&self, account_id: &str) -> AppResult<i64> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND ai_tagged_at IS NULL",
+            params![account_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// 组装分类输入：正文**不预取**——只有已缓存的正文才带上，
+    /// 让整理能覆盖从未打开过的邮件。
+    pub fn classify_input(&self, message_id: i64) -> AppResult<ClassifyInput> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT from_name, from_addr, subject, date_ts, snippet, body_loaded, body_text
+             FROM messages WHERE id = ?1",
+            params![message_id],
+            |row| {
+                let body_loaded: i64 = row.get("body_loaded")?;
+                let body_text: String = row.get("body_text")?;
+                Ok(ClassifyInput {
+                    from_name: row.get("from_name")?,
+                    from_addr: row.get("from_addr")?,
+                    subject: row.get("subject")?,
+                    date_ts: row.get("date_ts")?,
+                    snippet: row.get("snippet")?,
+                    body_text: (body_loaded != 0 && !body_text.trim().is_empty())
+                        .then_some(body_text),
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Other("邮件不存在".to_string()))
+    }
+
+    /// 发件人历史样本数（只统计**已整理**的邮件——快速通道与提示的依据）。
+    pub fn sender_classified_count(
+        &self,
+        account_id: &str,
+        from_addr: &str,
+        exclude_id: i64,
+    ) -> AppResult<i64> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE account_id = ?1 AND from_addr = ?2 AND id != ?3 AND ai_tagged_at IS NOT NULL",
+            params![account_id, from_addr, exclude_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// 该发件人已整理邮件在指定组内各标签的分布（按出现次数降序）。
+    pub fn sender_group_stats(
+        &self,
+        account_id: &str,
+        from_addr: &str,
+        exclude_id: i64,
+        group_id: i64,
+    ) -> AppResult<Vec<(i64, String, i64)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, COUNT(*) AS n
+             FROM messages m
+             JOIN message_tags mt ON mt.message_id = m.id
+             JOIN tags t ON t.id = mt.tag_id
+             JOIN tag_group_members gm ON gm.tag_id = t.id
+             WHERE m.account_id = ?1 AND m.from_addr = ?2 AND m.id != ?3
+               AND m.ai_tagged_at IS NOT NULL AND gm.group_id = ?4
+             GROUP BY t.id
+             ORDER BY n DESC, t.id ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![account_id, from_addr, exclude_id, group_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 写回单封邮件的整理结果——整件事在**一个事务**里原子完成。
+    ///
+    /// 语义（多对多组模型下「组内单选」的定义）：
+    /// 1. **用户保护**：邮件在某启用组内已有 `source='manual'` 行 → 整组跳过；
+    /// 2. 解析指派（候选命中 / 创建新标签）；
+    /// 3. **受限替换**：删除「属于启用组、来源为 AI、且不在本轮全部选中集合」的行——
+    ///    集合级判定与顺序无关，同一标签同属多个启用组时不会互相踩踏；
+    /// 4. 插入 `source='ai'`（`ON CONFLICT DO NOTHING`，manual 行永不降级）；
+    /// 5. 同事务写 `ai_tagged_at`——只有提交成功才算「已整理」，失败下次自动重试。
+    ///
+    /// 返回写回后的权威标签集合（供事件回推前端）。
+    pub fn save_classify_result(
+        &self,
+        account_id: &str,
+        message_id: i64,
+        assignments: &[GroupAssignment],
+        now: &str,
+    ) -> AppResult<Vec<i64>> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+
+        let mut active_groups: Vec<i64> = Vec::new();
+        let mut picked: Vec<i64> = Vec::new();
+
+        for a in assignments {
+            // 组可能在批处理途中被删（这几张表没有外键，必须重查防孤儿）。
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tag_groups WHERE id = ?1)",
+                params![a.group_id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                continue;
+            }
+            // 用户保护：组内已有手动标签 → 整组跳过（不删不写）。
+            let has_manual: bool = tx.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM message_tags mt
+                     JOIN tag_group_members gm ON gm.tag_id = mt.tag_id
+                     WHERE mt.message_id = ?1 AND gm.group_id = ?2 AND mt.source = 'manual')",
+                params![message_id, a.group_id],
+                |r| r.get(0),
+            )?;
+            if has_manual {
+                continue;
+            }
+            active_groups.push(a.group_id);
+            match &a.pick {
+                Some(Pick::Existing(id)) => picked.push(*id),
+                Some(Pick::New(name)) => {
+                    picked.push(resolve_or_create_tag(&tx, account_id, a.group_id, name, now)?);
+                }
+                None => {}
+            }
+        }
+
+        picked.sort_unstable();
+        picked.dedup();
+
+        // 删除阶段（受限替换）。
+        if !active_groups.is_empty() {
+            let group_ph = vec!["?"; active_groups.len()].join(",");
+            let mut sql = format!(
+                "DELETE FROM message_tags
+                 WHERE message_id = ?1 AND source = 'ai'
+                   AND tag_id IN (SELECT tag_id FROM tag_group_members
+                                  WHERE group_id IN ({group_ph}))"
+            );
+            let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(message_id)];
+            for g in &active_groups {
+                args.push(Box::new(*g));
+            }
+            if !picked.is_empty() {
+                let pick_ph = vec!["?"; picked.len()].join(",");
+                sql.push_str(&format!(" AND tag_id NOT IN ({pick_ph})"));
+                for p in &picked {
+                    args.push(Box::new(*p));
+                }
+            }
+            let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+            tx.execute(&sql, refs.as_slice())?;
+        }
+
+        // 插入阶段：manual 行遇同 (message, tag) 冲突时保持 manual。
+        for tag_id in &picked {
+            tx.execute(
+                "INSERT INTO message_tags (message_id, tag_id, source, created_at)
+                 VALUES (?1, ?2, 'ai', ?3)
+                 ON CONFLICT (message_id, tag_id) DO NOTHING",
+                params![message_id, tag_id, now],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE messages SET ai_tagged_at = ?1 WHERE id = ?2",
+            params![now, message_id],
+        )?;
+        tx.commit()?;
+
+        self.tags_of_message(message_id)
+    }
+
+    // ------------------------------------------------------------------
     // AI 缓存
     // ------------------------------------------------------------------
 
@@ -1237,6 +1511,72 @@ impl Store {
         .optional()?
         .ok_or_else(|| AppError::Other("邮件不存在".to_string()))
     }
+}
+
+/// 解析 AI 给出的新标签名：账号内已有（精确 / ASCII 大小写不敏感）→ 复用并加入本组；
+/// 否则创建新标签（`created_by='ai'`、确定性配色）并自动入组。
+///
+/// 「命中即复用并入组」而非「冲突即放弃」：完全可逆（用户可删标签、可移出组），
+/// 且能从源头压住 `steam` / `Steam` 这类同义标签漂移。
+fn resolve_or_create_tag(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    group_id: i64,
+    raw_name: &str,
+    now: &str,
+) -> AppResult<i64> {
+    let name = raw_name.trim();
+    let exact: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM tags WHERE account_id = ?1 AND name = ?2",
+            params![account_id, name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let existing = match exact {
+        Some(id) => Some(id),
+        // SQLite 的 lower() 只折叠 ASCII——正好覆盖「steam / Steam」这类场景。
+        None => tx
+            .query_row(
+                "SELECT id FROM tags WHERE account_id = ?1 AND lower(name) = lower(?2)",
+                params![account_id, name],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
+
+    let tag_id = match existing {
+        Some(id) => id,
+        None => {
+            let next_order: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM tags WHERE account_id = ?1",
+                    params![account_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            tx.execute(
+                "INSERT INTO tags (account_id, name, color, sort_order, created_at, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'ai')",
+                params![
+                    account_id,
+                    name,
+                    crate::classify::palette_color(name),
+                    next_order,
+                    now
+                ],
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+
+    // 无论复用还是新建，都确保该标签属于该组（复用场景下它可能原本在别的组）。
+    tx.execute(
+        "INSERT INTO tag_group_members (group_id, tag_id, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT (group_id, tag_id) DO NOTHING",
+        params![group_id, tag_id, now],
+    )?;
+    Ok(tag_id)
 }
 
 fn row_to_account(row: &Row) -> rusqlite::Result<Account> {

@@ -101,10 +101,12 @@ pub enum Pick {
 }
 
 /// 解析结果：`picks` 与传入的 `groups` 一一对齐（`None` = 该维度不指派）。
+///
+/// 模型给的 `confidence` 在解析内部即已消化（低于门槛时全部置 `None`），
+/// 不向上层暴露——上层无需也不该再基于它做任何决策。
 #[derive(Debug, Clone)]
 pub struct ParsedClassify {
     pub picks: Vec<Option<Pick>>,
-    pub confidence: f64,
 }
 
 // ---------------------------------------------------------------------
@@ -283,7 +285,7 @@ pub fn parse_classify(raw: &str, groups: &[DimensionGroup]) -> Option<ParsedClas
         })
         .collect();
 
-    Some(ParsedClassify { picks, confidence })
+    Some(ParsedClassify { picks })
 }
 
 /// 提取第一个 JSON 对象：剥 ```` ```json ```` / ```` ``` ```` 围栏，取首 `{` 到末 `}`。
@@ -323,7 +325,7 @@ fn match_key<'a, I: Iterator<Item = &'a str>>(keys: I, group_name: &str) -> Opti
         }
         if k.contains(group_name) || group_name.contains(k) {
             let diff = k_len.abs_diff(gn_len);
-            if best.map_or(true, |(_, d)| diff < d) {
+            if best.is_none_or(|(_, d)| diff < d) {
                 best = Some((k, diff));
             }
         }
@@ -416,7 +418,7 @@ pub fn match_name<'a>(raw: &str, candidates: &'a [(i64, String)]) -> Option<(i64
         let name_lower = name.to_ascii_lowercase();
         if name_lower.contains(&lower) || lower.contains(&name_lower) {
             let diff = name_len.abs_diff(needle_len);
-            if best.map_or(true, |(_, _, d)| diff < d) {
+            if best.is_none_or(|(_, _, d)| diff < d) {
                 best = Some((*id, name.as_str(), diff));
             }
         }
@@ -541,7 +543,6 @@ mod tests {
         let parsed = parse_classify(raw, &groups()).expect("应解析成功");
         assert_eq!(parsed.picks[0], Some(Pick::Existing(10)));
         assert_eq!(parsed.picks[1], Some(Pick::Existing(20)));
-        assert!((parsed.confidence - 0.9).abs() < 1e-6);
     }
 
     #[test]
@@ -635,11 +636,12 @@ mod tests {
         assert!(parsed.picks.iter().all(Option::is_none), "低置信应全部不指派");
     }
 
+    /// confidence 缺失时按默认 0.6 处理（≥ 门槛），照常指派。
     #[test]
-    fn missing_confidence_defaults() {
+    fn missing_confidence_uses_default() {
         let raw = r#"{"发件方":"NVIDA","内容":null}"#;
         let parsed = parse_classify(raw, &groups()).unwrap();
-        assert!((parsed.confidence - DEFAULT_CONFIDENCE).abs() < 1e-6);
+        assert_eq!(parsed.picks[0], Some(Pick::Existing(10)), "缺省置信度不应触发回退");
     }
 
     #[test]

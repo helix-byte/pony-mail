@@ -16,6 +16,8 @@ mod error;
 mod log;
 /// 检查更新（并发查询 Gitee / GitHub 的 releases/latest）。
 mod update;
+/// 系统托盘（托盘菜单、关闭到托盘、单实例唤醒窗口的共享入口）。
+mod tray;
 /// 实时收信监听（IDLE / 轮询 + 新邮件事件与系统通知）。
 /// 公开是因为 AppState 的 pub 字段引用了其事件类型。
 pub mod watcher;
@@ -45,8 +47,20 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例必须最先注册：插件按注册顺序执行，它要在任何建窗逻辑之前
+        // 拦下第二实例（第二实例即时退出，回调在第一实例里唤醒窗口）。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            tray::show_main(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        // 开机自启（Windows 写 HKCU 的 Run 启动项）；开关由设置页命令控制。
+        .plugin(tauri_plugin_autostart::init(
+            // 仅 macOS 使用；Windows 构建必须照样传（参数为必填）。
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None, // 不带额外启动参数：自启即正常打开主窗口
+        ))
+        .on_window_event(|window, event| tray::on_window_event(window, event))
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -66,6 +80,15 @@ pub fn run() {
             });
             // 为已登记的每个账号拉起实时收信监听（新账号在 add_account 里即时启动）。
             watcher::start_all(app.handle());
+
+            // 系统托盘：关闭到托盘、托盘菜单与左键切换窗口。
+            // 失败仅记日志（关闭拦截会自动退化为「放行关闭」），不阻断启动。
+            if let Err(e) = tray::init(app.handle()) {
+                log::log_line(app.handle(), "tray", &format!("托盘创建失败：{e}"));
+            } else {
+                // 启动即按库中未读数刷新一次 tooltip。
+                tray::refresh(app.handle());
+            }
 
             // 启动后延迟自动检查更新：避开启动高峰（IMAP 监听/同步相继起步）；
             // 仅正式构建触发；发现新版本且未被跳过时推送 update:available 事件。
@@ -145,6 +168,10 @@ pub fn run() {
             commands::get_update_settings,
             commands::set_update_settings,
             commands::check_update,
+            commands::get_tray_settings,
+            commands::set_tray_settings,
+            commands::get_autostart,
+            commands::set_autostart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

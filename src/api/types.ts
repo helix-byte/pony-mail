@@ -175,6 +175,12 @@ export interface UpdateSettings {
   skippedVersion: string;
 }
 
+/** 托盘行为设置（与 AI / 邮件 / 更新设置分开存储）。 */
+export interface TraySettings {
+  /** 关闭窗口时最小化到托盘（缺省视为开启）。 */
+  closeToTray: boolean;
+}
+
 /** 新邮件事件（`mail:new`）携带的单封摘要。 */
 export interface NewMailItem {
   subject: string;

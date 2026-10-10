@@ -15,6 +15,10 @@ const autoClassify = ref(true);
 const autoSummarize = ref(true);
 /** 新邮件到达时弹系统通知（缺省开启）。 */
 const notifyNewMail = ref(true);
+/** 关闭窗口时最小化到托盘（缺省开启）。 */
+const closeToTray = ref(true);
+/** 开机自动启动（onMounted 时读 Windows 注册表的实际状态）。 */
+const autostart = ref(false);
 /** 当前版本号（启动时读取，失败留空）。 */
 const version = ref("");
 /** 启动后自动检查更新（缺省开启）。 */
@@ -42,6 +46,17 @@ onMounted(async () => {
   try {
     const m = await api.getMailSettings();
     notifyNewMail.value = m.notifyNewMail;
+  } catch (e) {
+    store.toast(errorText(e), "error");
+  }
+  try {
+    const t = await api.getTraySettings();
+    closeToTray.value = t.closeToTray;
+  } catch (e) {
+    store.toast(errorText(e), "error");
+  }
+  try {
+    autostart.value = await api.getAutostart();
   } catch (e) {
     store.toast(errorText(e), "error");
   }
@@ -110,6 +125,8 @@ async function save() {
       autoCheck: autoCheck.value,
       skippedVersion: skippedVersion.value,
     });
+    await api.setTraySettings({ closeToTray: closeToTray.value });
+    await api.setAutostart(autostart.value);
     // 刷新 store 缓存：避免「跳过此版本」基于过期设置回写。
     void store.loadUpdateSettings();
     // 刷新 store 缓存：自动整理开关立即生效（sync 完成后读取的正是它）。
@@ -149,6 +166,33 @@ async function save() {
               收到新邮件时弹出系统通知。应用会为每个账号保持 IMAP 实时监听
               （服务器支持时走 IDLE 推送），新邮件自动出现在列表里，无需手动同步；
               关闭此项后不再弹系统通知，仅保留应用内提示。
+            </span>
+          </span>
+        </label>
+
+        <div class="flex items-center gap-3 pt-1">
+          <span class="text-[11px] font-medium tracking-wide text-zinc-500">托盘与启动</span>
+          <span class="h-px flex-1 bg-line" />
+        </div>
+
+        <label class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <input v-model="closeToTray" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500" />
+          <span class="min-w-0">
+            <span class="block text-[12.5px] text-zinc-300">关闭窗口时最小化到托盘</span>
+            <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
+              点右上角关闭按钮时隐藏到系统托盘，收信不会中断；右键托盘图标选「退出」才会真正退出应用。
+              关闭此项后，点关闭按钮直接退出。
+            </span>
+          </span>
+        </label>
+
+        <label class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <input v-model="autostart" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500" />
+          <span class="min-w-0">
+            <span class="block text-[12.5px] text-zinc-300">开机自动启动</span>
+            <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
+              登录 Windows 后自动在后台启动 Pony Mail，持续实时收信。
+              写入当前用户的启动项，无需管理员权限。
             </span>
           </span>
         </label>

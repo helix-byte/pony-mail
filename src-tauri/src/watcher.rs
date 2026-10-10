@@ -28,6 +28,7 @@ use crate::error::AppResult;
 use crate::mail::imap_client;
 use crate::models::{Account, ParsedMail};
 use crate::store::Store;
+use crate::tray;
 use crate::AppState;
 
 /// 监听的目标文件夹（当前产品只做收件箱）。
@@ -274,6 +275,9 @@ fn watch_once(
     let limit = if initial { INITIAL_FETCH_LIMIT } else { FETCH_LIMIT };
     let t0 = std::time::Instant::now();
     let fresh = poll_new(store, &mut session, &account.id, limit)?;
+    // 首轮可能已静默插入邮件（initial 补齐不走 deliver），这里统一刷一次托盘；
+    // 非 initial 时 deliver 内还会再刷一次，refresh 幂等无副作用。
+    tray::refresh(app);
     watch_log(
         app,
         &format!("首轮检查完成（{:?}）：{} 封新邮件", t0.elapsed(), fresh.len()),
@@ -416,6 +420,8 @@ fn deliver(app: &AppHandle, store: &Store, account: &Account, fresh: Vec<ParsedM
             messages,
         },
     );
+    // 新邮件已落库 → 未读总数变化，刷新托盘 tooltip。
+    tray::refresh(app);
     let newest_desc = fresh
         .iter()
         .max_by_key(|m| m.uid)

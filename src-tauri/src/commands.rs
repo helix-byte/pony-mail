@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt;
 use uuid::Uuid;
 
 use crate::ai;
@@ -14,6 +15,7 @@ use crate::error::{AppError, AppResult};
 use crate::mail::{imap_client, smtp_client};
 use crate::models::*;
 use crate::store::GroupAssignment;
+use crate::tray;
 use crate::update::{self, UpdateInfo};
 use crate::watcher;
 use crate::AppState;
@@ -58,6 +60,8 @@ pub fn delete_account(app: AppHandle, state: State<'_, AppState>, id: String) ->
     watcher::stop(&app, &id);
     state.store.delete_account(&id)?;
     credentials::delete_password(&id)?;
+    // 级联删除会移除该账号的全部邮件（含未读），刷新托盘未读提示。
+    tray::refresh(&app);
     Ok(())
 }
 
@@ -123,6 +127,7 @@ pub async fn test_connection(input: AccountInput) -> AppResult<TestReport> {
 
 #[tauri::command]
 pub async fn sync_inbox(
+    app: AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     folder: String,
@@ -138,9 +143,13 @@ pub async fn sync_inbox(
     };
     let limit = limit.clamp(1, 200);
 
-    tauri::async_runtime::spawn_blocking(move || sync_folder(&store, &account, &password, &folder, limit))
-        .await
-        .map_err(|e| AppError::Other(format!("同步任务异常：{e}")))?
+    let report =
+        tauri::async_runtime::spawn_blocking(move || sync_folder(&store, &account, &password, &folder, limit))
+            .await
+            .map_err(|e| AppError::Other(format!("同步任务异常：{e}")))??;
+    // 重同步会用服务端 seen 覆盖本地状态（双向变化都可能），刷新托盘未读提示。
+    tray::refresh(&app);
+    Ok(report)
 }
 
 fn sync_folder(
@@ -229,6 +238,45 @@ pub fn set_update_settings(state: State<'_, AppState>, settings: UpdateSettings)
     state.store.save_update_settings(&settings)
 }
 
+// ---------------------------------------------------------------------
+// 托盘与开机自启
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_tray_settings(state: State<'_, AppState>) -> AppResult<TraySettings> {
+    state.store.tray_settings()
+}
+
+#[tauri::command]
+pub fn set_tray_settings(state: State<'_, AppState>, settings: TraySettings) -> AppResult<()> {
+    state.store.save_tray_settings(&settings)
+}
+
+/// 开机自启当前状态：直读 Windows 注册表实际值（非本地缓存，
+/// 用户从任务管理器禁用启动项后此处也能如实反映）。
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> AppResult<bool> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| AppError::Other(format!("读取开机自启状态失败：{e}")))
+}
+
+/// 启用 / 关闭开机自启（写当前用户的启动项，无需管理员权限）。
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
+    let result = if enabled {
+        app.autolaunch().enable()
+    } else {
+        app.autolaunch().disable()
+    };
+    result.map_err(|e| {
+        AppError::Other(format!(
+            "{}开机自启失败：{e}",
+            if enabled { "启用" } else { "关闭" }
+        ))
+    })
+}
+
 /// 各账号监听状态的最新快照。
 ///
 /// 前端启动时先查一次对齐（早期事件可能在页面监听挂上之前就已广播），
@@ -292,8 +340,15 @@ pub async fn load_message_body(state: State<'_, AppState>, id: i64) -> AppResult
 }
 
 #[tauri::command]
-pub async fn set_seen(state: State<'_, AppState>, id: i64, seen: bool) -> AppResult<()> {
+pub async fn set_seen(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    seen: bool,
+) -> AppResult<()> {
     state.store.set_seen(id, seen)?;
+    // 本地已读状态已生效，先刷托盘未读提示，再回写服务器（有网络往返）。
+    tray::refresh(&app);
     push_flag(state, id, "\\Seen", seen).await;
     Ok(())
 }
@@ -332,7 +387,11 @@ async fn push_flag(state: State<'_, AppState>, id: i64, flag: &'static str, on: 
 /// 设计上「服务器失败不阻断本地清理」——否则用户会陷入「删不掉又看不到」的困境。
 /// 但会用 [`DeleteReport::deleted_remote`] 如实回报，前端据此提示差异。
 #[tauri::command]
-pub async fn delete_message(state: State<'_, AppState>, id: i64) -> AppResult<DeleteReport> {
+pub async fn delete_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+) -> AppResult<DeleteReport> {
     // 先取路由信息（删除后就读不到了）。
     let (account_id, folder, uid) = state.store.message_route(id)?;
     let store = state.store.clone();
@@ -364,6 +423,8 @@ pub async fn delete_message(state: State<'_, AppState>, id: i64) -> AppResult<De
     state.store.delete_message(id)?;
     // 同步该文件夹的邮件计数（失败不影响主流程）。
     let _ = state.store.refresh_folder_count(&route_account, &route_folder);
+    // 删除未读邮件会改变未读总数，本地清理完成后刷新托盘提示。
+    tray::refresh(&app);
 
     Ok(DeleteReport {
         deleted_local: 1,
@@ -374,7 +435,11 @@ pub async fn delete_message(state: State<'_, AppState>, id: i64) -> AppResult<De
 
 /// 批量删除邮件（供后续多选删除复用）。
 #[tauri::command]
-pub async fn delete_messages(state: State<'_, AppState>, ids: Vec<i64>) -> AppResult<DeleteReport> {
+pub async fn delete_messages(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+) -> AppResult<DeleteReport> {
     if ids.is_empty() {
         return Ok(DeleteReport {
             deleted_local: 0,
@@ -429,6 +494,8 @@ pub async fn delete_messages(state: State<'_, AppState>, ids: Vec<i64>) -> AppRe
     for (account_id, folder) in &folders {
         let _ = state.store.refresh_folder_count(account_id, folder);
     }
+    // 删除未读邮件会改变未读总数，本地清理完成后刷新托盘提示。
+    tray::refresh(&app);
 
     Ok(DeleteReport {
         deleted_local,

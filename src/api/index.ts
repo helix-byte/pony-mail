@@ -16,6 +16,7 @@ import type {
   Tag,
   TagGroup,
   TestReport,
+  TraySettings,
   UpdateInfo,
   UpdateSettings,
   WatchStateEvent,
@@ -121,6 +122,13 @@ export const api = {
   getUpdateSettings: () => invoke<UpdateSettings>("get_update_settings"),
   setUpdateSettings: (settings: UpdateSettings) =>
     invoke<void>("set_update_settings", { settings }),
+
+  // ---- 托盘与开机自启 ----
+  getTraySettings: () => invoke<TraySettings>("get_tray_settings"),
+  setTraySettings: (settings: TraySettings) => invoke<void>("set_tray_settings", { settings }),
+  /** 开机自启当前状态（读取 Windows 注册表实际值，非本地缓存）。 */
+  getAutostart: () => invoke<boolean>("get_autostart"),
+  setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
 };
 
 /** 统一把后端错误（字符串）转成可展示文案。 */

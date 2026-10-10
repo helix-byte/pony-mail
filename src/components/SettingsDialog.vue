@@ -8,6 +8,8 @@ const store = useMailStore();
 
 const baseUrl = ref("http://localhost:11434");
 const model = ref("qwen3.5:9b");
+/** 同步完成后自动整理新邮件（缺省开启）。 */
+const autoClassify = ref(true);
 const models = ref<string[]>([]);
 const online = ref(false);
 const message = ref("");
@@ -19,6 +21,7 @@ onMounted(async () => {
     const s = await api.getAiSettings();
     baseUrl.value = s.baseUrl;
     model.value = s.model;
+    autoClassify.value = s.autoClassify;
   } catch (e) {
     store.toast(errorText(e), "error");
   }
@@ -46,7 +49,13 @@ async function check() {
 async function save() {
   saving.value = true;
   try {
-    await api.setAiSettings({ baseUrl: baseUrl.value.trim(), model: model.value.trim() });
+    await api.setAiSettings({
+      baseUrl: baseUrl.value.trim(),
+      model: model.value.trim(),
+      autoClassify: autoClassify.value,
+    });
+    // 刷新 store 缓存：自动整理开关立即生效（sync 完成后读取的正是它）。
+    void store.loadAiSettings();
     store.toast("AI 设置已保存", "ok");
     store.ui.settingsOpen = false;
   } catch (e) {
@@ -111,6 +120,17 @@ async function save() {
             {{ m }}
           </button>
         </div>
+
+        <label class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <input v-model="autoClassify" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500" />
+          <span class="min-w-0">
+            <span class="block text-[12.5px] text-zinc-300">同步完成后自动整理</span>
+            <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
+              同步收件箱后，自动用本地模型为未整理的邮件打标签。
+              在左侧「标签」区域编辑标签组时，可选择哪些组交给 AI 整理。
+            </span>
+          </span>
+        </label>
 
         <div class="rounded-xl border border-line bg-panel-2/60 p-3.5">
           <div class="flex items-center gap-2">

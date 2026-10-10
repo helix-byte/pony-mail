@@ -108,6 +108,13 @@ function onMenuToggleTag(tagId: number) {
   void store.toggleMessageTag(id, tagId);
 }
 
+/** 右键菜单「AI 自动标签」：为这封邮件单独跑一次智能整理。 */
+function onClassifyOne() {
+  const id = menu.messageId;
+  closeMenu();
+  if (id !== null) void store.classifyMessage(id);
+}
+
 // 滚动 / 缩放 / 按 Esc 都应关闭菜单，否则菜单会「漂」在错误位置。
 function onKeydown(e: KeyboardEvent) {
   if (e.key === "Escape") closeMenu();
@@ -164,9 +171,49 @@ onBeforeUnmount(() => {
           <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
         </svg>
       </button>
+      <!-- 智能整理：空闲为入口，运行中显示逐封进度、点击即停止 -->
+      <button
+        v-if="store.classifying"
+        class="flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-indigo-500/40 bg-indigo-500/10 px-2.5 text-[11.5px] font-medium text-indigo-300 transition hover:border-indigo-400"
+        title="点击停止整理（已整理的结果会保留）"
+        @click="store.cancelClassify()"
+      >
+        <span
+          class="h-3 w-3 shrink-0 animate-spin rounded-full border-[1.5px] border-indigo-400 border-t-transparent"
+        />
+        {{
+          store.classifyProgress
+            ? `整理中 ${store.classifyProgress.done}/${store.classifyProgress.total}`
+            : "整理中…"
+        }}
+      </button>
+      <button
+        v-else
+        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-line text-zinc-400 transition hover:border-accent/50 hover:text-indigo-300 disabled:opacity-40"
+        :disabled="!store.activeAccountId || store.busy.sync"
+        title="智能整理：用本地模型为未整理的邮件自动打标签"
+        @click="store.classifyAll()"
+      >
+        <svg
+          class="h-4 w-4"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+        >
+          <path
+            d="M12 3l1.7 4.9 4.8 1.7-4.8 1.7L12 16.2l-1.7-4.9-4.8-1.7 4.8-1.7z"
+            stroke-linejoin="round"
+          />
+          <path
+            d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
       <button
         class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-line text-zinc-400 transition hover:border-accent/50 hover:text-indigo-300 disabled:opacity-40"
-        :disabled="store.busy.sync || !store.activeAccountId"
+        :disabled="store.busy.sync || store.classifying || !store.activeAccountId"
         title="同步收件箱"
         @click="store.sync()"
       >
@@ -391,6 +438,37 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="my-1 h-px bg-line" />
+
+        <!-- AI 自动标签：为这封邮件单独跑一次智能整理（批量进行中时禁用） -->
+        <button
+          class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] transition"
+          :class="
+            store.classifying || store.classifyOneBusy
+              ? 'cursor-not-allowed text-zinc-600'
+              : 'text-zinc-300 hover:bg-hover'
+          "
+          :disabled="store.classifying || store.classifyOneBusy"
+          @click="onClassifyOne"
+        >
+          <svg
+            class="h-3.5 w-3.5 shrink-0"
+            :class="store.classifying || store.classifyOneBusy ? 'text-zinc-700' : 'text-zinc-500'"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+          >
+            <path
+              d="M12 3l1.7 4.9 4.8 1.7-4.8 1.7L12 16.2l-1.7-4.9-4.8-1.7 4.8-1.7z"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"
+              stroke-linejoin="round"
+            />
+          </svg>
+          AI 自动标签
+        </button>
 
         <button
           class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-rose-400 transition hover:bg-rose-500/15"

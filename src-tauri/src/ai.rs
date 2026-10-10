@@ -6,21 +6,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::models::{AiSettings, AiStatus, MessageDetail};
 
-const SYSTEM_PROMPT: &str = "\
-你是一位专业的邮件助理，用简体中文做客观的信息提炼。输出简洁，直接给出结论。";
+const SYSTEM_PROMPT: &str =
+    "你是一位专业的邮件助理，负责用简体中文提炼真实邮件的关键信息。";
 
-const USER_TEMPLATE: &str = r#"请用简体中文总结下面这封邮件，按三行输出：
+const USER_TEMPLATE: &str = r#"下面是一封真实收到的邮件。请阅读它，然后输出一个 JSON 对象（只输出 JSON）：
 
-【一句话概括】（一句话说明这封邮件的主题）
-【关键信息】（2 到 4 条要点，每条一行，以「- 」开头）
-【需要我做什么】（收件人需要采取的行动；没有则写“无”）
+{"summary":"一句话概括这封邮件的主题","points":["2 到 4 条关键要点"],"action":"收件人需要采取的行动，没有则输出 null"}
 
-注意：【关键信息】要提炼邮件的实际内容，不要照抄发件人或时间等头部信息。
-
-邮件内容：
----
+===== 邮件开始 =====
 {content}
----"#;
+===== 邮件结束 =====
+
+要求：summary 一句话；points 每条提炼实际内容（不要照抄发件人、时间等头部信息）；全部使用简体中文（品牌名保留原名）。"#;
 
 #[derive(Serialize)]
 struct ChatMessage {
@@ -46,6 +43,12 @@ struct ChatRequest {
     /// 显式关闭后，同样的任务耗时从数十秒降到数秒，且直接产出中文摘要。
     #[serde(skip_serializing_if = "Option::is_none")]
     think: Option<bool>,
+    /// 让 Ollama 在采样层面按 JSON 语法约束输出（只让结构化任务使用）。
+    ///
+    /// 实测：不加也能出合法 JSON 的模型加了更快；对不听话的模型则从机制上
+    /// 消除「前后加解释 / 代码块围栏 / 少个括号」这类格式问题。是增强而非必需。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
     options: ChatOptions,
 }
 
@@ -144,7 +147,20 @@ pub async fn status(client: &reqwest::Client, settings: &AiSettings) -> AiStatus
     }
 }
 
-/// 调用本地模型生成邮件摘要。
+/// 摘要的 JSON 输出载荷（模型被要求输出的结构）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SummaryPayload {
+    pub summary: String,
+    pub points: Vec<String>,
+    pub action: Option<String>,
+}
+
+/// 调用本地模型生成邮件摘要，组装为既有的三节文本。
+///
+/// 输出走 `format:"json"` 单对象（实测 2026-10-10：自由文本模式下 qwen2.5:7b
+/// 对营销/通知类邮件频繁复读与角色跑偏——把邮件当"待校对的文档"、复读指令与
+/// 输入特征，38~60 秒烧完预算；JSON 约束把模型锁进"填字段"角色后 4/4 稳定、
+/// 10~16 秒、无复读）。JSON 合法但缺 summary 视为跑偏，重试一发。
 pub async fn summarize(
     client: &reqwest::Client,
     settings: &AiSettings,
@@ -155,22 +171,219 @@ pub async fn summarize(
         return Ok("【一句话概括】无有效内容".to_string());
     }
 
-    match request_summary(client, settings, &settings.model, &content).await {
-        // 配置的模型不存在时，自动退回本机第一个可用模型，避免开箱即报错。
+    let first = run_with_recovery(client, settings, |model| {
+        request_summary(client, settings, model, &content)
+    })
+    .await?;
+    if let Some(payload) = parse_summary(&first) {
+        return Ok(render_summary(&payload));
+    }
+
+    // 输出跑偏（JSON 非法 / 缺 summary 字段）→ 重试一发；仍失败不再硬凑，
+    // 不把垃圾写进缓存。
+    let retry = run_with_recovery(client, settings, |model| {
+        request_summary(client, settings, model, &content)
+    })
+    .await?;
+    parse_summary(&retry)
+        .map(|payload| render_summary(&payload))
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "模型「{}」连续两次未能按 JSON 格式输出摘要。可尝试在「AI 设置」中更换模型后重试。",
+                settings.model
+            ))
+        })
+}
+
+/// 提取第一个 JSON 对象：剥 ```` ```json ```` / ```` ``` ```` 围栏，取首 `{` 到末 `}`。
+///
+/// `format:"json"` 下通常用不到，作为兜底保留。分类与摘要两条链路共用。
+pub(crate) fn extract_json_object(raw: &str) -> Option<&str> {
+    let t = raw.trim();
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t);
+    let t = t.strip_suffix("```").unwrap_or(t);
+    let start = t.find('{')?;
+    let end = t.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(&t[start..=end])
+}
+
+/// 解析摘要 JSON：键名与值形态都做容错——7B 级模型会漂移键名
+/// （实测出现「主题 / 关键要点 / 行动」等中文别名，甚至把整封邮件重排成嵌套对象）。
+/// 解析不出有效 summary 时返回 `None`（调用方据此判定跑偏并重试）。
+pub(crate) fn parse_summary(raw: &str) -> Option<SummaryPayload> {
+    let value: serde_json::Value = serde_json::from_str(extract_json_object(raw)?).ok()?;
+    let obj = value.as_object()?;
+
+    let mut taken: Vec<String> = Vec::new();
+    let (k, summary_value) = pick_key(
+        obj,
+        &taken,
+        &["summary"],
+        &["一句话概括", "概括", "摘要", "主题", "概述", "简概"],
+    )?;
+    taken.push(k.to_string());
+    let summary = summary_value.as_str()?.trim().to_string();
+    if summary.is_empty() || is_placeholder(&summary) {
+        return None;
+    }
+
+    let points = pick_key(
+        obj,
+        &taken,
+        &["points"],
+        &["关键要点", "要点", "关键信息", "主要内容"],
+    )
+    .map(|(k, v)| {
+        taken.push(k.to_string());
+        collect_points(v)
+    })
+    .unwrap_or_default();
+
+    let action = pick_key(
+        obj,
+        &taken,
+        &["action", "todo"],
+        &["需要我做什么", "需要采取的行动", "需要做的", "行动", "下一步", "待办"],
+    )
+    .and_then(|(_, v)| v.as_str().map(str::trim))
+    .filter(|s| !s.is_empty() && !is_placeholder(s))
+    .map(str::to_string);
+
+    Some(SummaryPayload {
+        summary,
+        points,
+        action,
+    })
+}
+
+/// 在响应对象里找一个键（排除已占用者）：精确（ASCII 大小写不敏感）→ 别名精确
+/// → 双向包含取任意命中（键 ≥2 字）。
+fn pick_key<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    taken: &[String],
+    exact: &[&str],
+    aliases: &[&str],
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    let free: Vec<(&str, &serde_json::Value)> = obj
+        .iter()
+        .filter(|(k, _)| !taken.iter().any(|t| t.as_str() == k.as_str()))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+
+    for want in exact {
+        if let Some((k, v)) = free.iter().find(|(k, _)| k.eq_ignore_ascii_case(want)) {
+            return Some((k, v));
+        }
+    }
+    for want in aliases {
+        if let Some((k, v)) = free.iter().find(|(k, _)| k.trim() == *want) {
+            return Some((k, v));
+        }
+    }
+    for want in aliases {
+        if let Some((k, v)) = free.iter().find(|(k, _)| {
+            let kk = k.trim();
+            kk.chars().count() >= 2 && (kk.contains(*want) || want.contains(kk))
+        }) {
+            return Some((k, v));
+        }
+    }
+    None
+}
+
+/// 把 points 值转成字符串列表：数组逐项取值，字符串按行拆分。
+fn collect_points(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        out.push(s.to_string());
+                    }
+                }
+            }
+        }
+        serde_json::Value::String(s) => {
+            for line in s.lines() {
+                let line = line.trim().trim_start_matches(['-', '*', '•', ' ']).trim();
+                if !line.is_empty() {
+                    out.push(line.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// 组装成既有的三节文本（前端与缓存格式不变）。
+pub(crate) fn render_summary(payload: &SummaryPayload) -> String {
+    let mut out = format!("【一句话概括】{}\n【关键信息】\n", payload.summary);
+    if payload.points.is_empty() {
+        out.push_str("- （无）\n");
+    } else {
+        for point in &payload.points {
+            out.push_str(&format!("- {point}\n"));
+        }
+    }
+    let action = payload.action.as_deref().unwrap_or("无");
+    out.push_str(&format!("【需要我做什么】{action}"));
+    out
+}
+
+/// 占位词判定（模型用「无 / null / 不确定」凑字段时视为无值）。
+fn is_placeholder(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "null" | "none" | "nil" | "n/a")
+        || matches!(s.trim(), "无" | "没有" | "不确定" | "未知" | "不适用")
+}
+
+/// 统一自愈包装：给「用某个模型发一次请求」的操作加上两类恢复。
+///
+/// 1. **模型未安装**（`ModelNotFound`）：自动换本机第一个可用模型重试一次，
+///    避免开箱即报错；
+/// 2. **runner 病态**（`ModelBusy`：复读保护 500 或 HTTP 200 空壳，两者实测同源）：
+///    卸载模型、稍候、重试一次。实测卸载后立刻重试常常仍然病态（同一输入会
+///    先成功后失败，且多模型同时驻留会显著恶化），所以留一拍让 runner 退出重载。
+///    再失败则按调用方的连续失败计数/熔断处理，避免无限自愈。
+pub(crate) async fn run_with_recovery<F, Fut>(
+    client: &reqwest::Client,
+    settings: &AiSettings,
+    call: F,
+) -> AppResult<String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = AppResult<String>>,
+{
+    match call(settings.model.clone()).await {
         Err(AppError::ModelNotFound(_)) => {
             let fallback = first_available_model(client, settings).await?;
-            request_summary(client, settings, &fallback, &content).await
+            call(fallback).await
         }
-        // 复读保护：Ollama 的 runner 会偶发进入"卡死"状态，同样输入时好时坏。
-        // 实测卸载模型（keep_alive:0）再重载即可恢复，故此处自动重试一次。
         Err(AppError::ModelBusy(_)) => {
             let _ = unload_model(client, settings, &settings.model).await;
-            match request_summary(client, settings, &settings.model, &content).await {
+            // 实测（2026-10-09，本机 0.40.2 + qwen3.5:9b）：
+            // - runner 进入病态后不会自发恢复——不卸载的话后续请求持续空壳（跨分钟级）；
+            // - 卸载后立即/1.5s 重试仍空壳（runner 尚未退干净），冷却 5s 后重载即恢复
+            //   （恢复后多个请求连续健康）。
+            // 因此等待取 5s：短暂延迟换自愈成功率；仍失败则由调用方计连续失败并熔断。
+            tokio::time::sleep(Duration::from_millis(5000)).await;
+            match call(settings.model.clone()).await {
                 Ok(text) => Ok(text),
-                // 重载后仍然复读，说明不是 runner 状态问题。给出可执行的建议。
+                // 重载后仍然病态，说明不是短暂的 runner 状态问题。给出可执行的建议；
+                // 调用方（批量整理）会把它计入连续失败并最终熔断。
                 Err(AppError::ModelBusy(_)) => Err(AppError::Other(format!(
-                    "模型「{}」连续两次陷入重复循环。可尝试：①在「AI 设置」中改选\
-                     其他模型（如 qwen2.5:14b / deepseek-r1:7b）；②重启 Ollama 服务。",
+                    "模型「{}」连续两次陷入异常状态（重复循环或空响应）。可尝试：\
+                     ①在「AI 设置」中改选其他模型（如 qwen2.5:14b / deepseek-r1:7b）；\
+                     ②重启 Ollama 服务后重试。",
                     settings.model
                 ))),
                 other => other,
@@ -178,6 +391,66 @@ pub async fn summarize(
         }
         other => other,
     }
+}
+
+/// 结构化分类请求：`format:"json"` + `think:false` + `temperature:0`。
+///
+/// 返回模型输出的 JSON 原文（解析与容错由 `classify` 模块负责）。
+/// 与摘要共用 [`run_with_recovery`] 的自愈链路，参数差异只在本函数里；
+/// `model` 按值接收的原因同 [`request_summary`]。
+pub(crate) async fn chat_json(
+    client: &reqwest::Client,
+    settings: &AiSettings,
+    model: String,
+    system: &str,
+    user: &str,
+    num_predict: i32,
+) -> AppResult<String> {
+    let url = format!("{}/api/chat", base_of(settings));
+    let body = ChatRequest {
+        model: model.clone(),
+        messages: vec![
+            ChatMessage {
+                role: "system",
+                content: system.to_string(),
+            },
+            ChatMessage {
+                role: "user",
+                content: user.to_string(),
+            },
+        ],
+        stream: false,
+        think: Some(false),
+        format: Some("json"),
+        options: ChatOptions {
+            // 分类同属确定性任务：温度取 0 压住小模型的格式抖动。
+            temperature: 0.0,
+            num_predict,
+        },
+    };
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        // 分类输出很短，但首次调用可能含模型加载；3 分钟足够覆盖冷启动。
+        .timeout(Duration::from_secs(180))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if let Some(mapped) = map_ollama_error(&text) {
+            return Err(mapped);
+        }
+        return Err(AppError::Other(format!(
+            "AI 服务返回 {code}：{}",
+            truncate(&text, 200)
+        )));
+    }
+
+    let parsed: ChatResponse = resp.json().await?;
+    extract_content(parsed, &model)
 }
 
 /// 请求 Ollama 立即卸载指定模型（释放 runner / 显存）。
@@ -227,15 +500,18 @@ async fn first_available_model(
 }
 
 /// 用指定模型发一次摘要请求。
+///
+/// `model` 按值接收：调用方是 `run_with_recovery` 的闭包，闭包返回的 future
+/// 不能借用闭包局部变量（生命周期逃逸），按值 move 进 future 才能成立。
 async fn request_summary(
     client: &reqwest::Client,
     settings: &AiSettings,
-    model: &str,
+    model: String,
     content: &str,
 ) -> AppResult<String> {
     let url = format!("{}/api/chat", base_of(settings));
     let body = ChatRequest {
-        model: model.to_string(),
+        model: model.clone(),
         messages: vec![
             ChatMessage {
                 role: "system",
@@ -248,10 +524,12 @@ async fn request_summary(
         ],
         stream: false,
         think: Some(false),
+        // 摘要同样走 JSON 语法约束（见 summarize 的注释：防复读与角色跑偏）。
+        format: Some("json"),
         options: ChatOptions {
             // 摘要属确定性任务，温度取 0 可显著提升小模型的格式稳定性。
             temperature: 0.0,
-            // 摘要只需 ~200 字；预算给太大会让 4B 级模型重复输出、跑偏格式。
+            // 摘要（含要点）约 300 字；预算给太大会让 4B 级模型重复输出、跑偏格式。
             num_predict: 512,
         },
     };
@@ -276,6 +554,16 @@ async fn request_summary(
     }
 
     let parsed: ChatResponse = resp.json().await?;
+    extract_content(parsed, &model)
+}
+
+/// 从 Ollama 响应中提取有效输出；空内容映射为 [`AppError::ModelBusy`]。
+///
+/// HTTP 200 空壳响应（`{"model":"","created_at":"0001-01-01T00:00:00Z",...}`，
+/// message 存在但 content 为空）与复读保护 500 实测**同源**，都是 runner 的
+/// 时间性病态（同一输入会先成功后失败），必须走「卸载 → 稍候 → 重试」的自愈
+/// 链路，绝不能把空内容当成「模型判定为空」静默消费。
+fn extract_content(parsed: ChatResponse, model: &str) -> AppResult<String> {
     if let Some(err) = parsed.error {
         if err.contains("not found") {
             return Err(AppError::ModelNotFound(model.to_string()));
@@ -292,9 +580,8 @@ async fn request_summary(
         .to_string();
 
     if text.is_empty() {
-        return Err(AppError::Other(format!(
-            "模型没有输出有效内容（模型：{model}）。请确认该模型支持文本生成，\
-             或在「AI 设置」中换用其他模型。"
+        return Err(AppError::ModelBusy(format!(
+            "Ollama 返回空响应（模型：{model}）"
         )));
     }
     Ok(text)
@@ -334,7 +621,9 @@ fn build_content(detail: &MessageDetail) -> String {
     } else {
         strip_html(&detail.body_html)
     };
-    let body = truncate(&reduce_noise(&raw), 4000);
+    // 正文上限 1200 字（2026-10-10 实测）：失败/复读集中在大输入上；JSON 约束
+    // 虽大幅降低长度敏感性，仍保持小输入以进一步压复读风险、加快推理。
+    let body = truncate(&reduce_noise(&raw), 1200);
 
     format!(
         "发件人：{} <{}>\n收件人：{}\n时间：{}\n主题：{}\n\n正文：\n{}",
@@ -347,7 +636,8 @@ fn build_content(detail: &MessageDetail) -> String {
     )
 }
 
-/// 降低正文噪音：去掉不可见填充字符与 URL、折叠连续重复行/句、压缩空白。
+/// 降低正文噪音：去掉不可见填充字符与 URL、折叠连续重复行/句、压缩空白、
+/// 过滤结构性垃圾行（CSS 残渣 / 纯符号行）、全局面级去重。
 ///
 /// 核心目的是削弱「高度重复的 token 序列」——
 /// - 营销邮件用零宽字符填充预览文本（见 [`strip_invisible`]）
@@ -356,13 +646,25 @@ fn build_content(detail: &MessageDetail) -> String {
 ///
 /// 这些都会让小模型陷入复读，触发 Ollama 的
 /// `prediction aborted, token repeat limit reached`。
-fn reduce_noise(text: &str) -> String {
+///
+/// 2026-10-10 增强（实测驱动）：HTML 降级提取的 `body_text` 里常有成片的
+/// `sup { font-size:100% !important; }` 样式残渣与图片 alt 留下的 `( )` 纯符号行，
+/// 实测直接诱发模型复读符号本身；重复行也不再要求"连续"——被空行分隔的重复
+/// （实测的 `( )\n\n( )` 形态）同样照抄诱发复读，故改为**全局面级去重**。
+///
+/// `pub(crate)`：智能整理的分类输入也要先过同一套降噪。
+pub(crate) fn reduce_noise(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut prev_line: Option<String> = None;
 
     for line in text.lines() {
         let cleaned = strip_urls(line);
         let collapsed = collapse_repeats(&collapse_ws(&cleaned));
+        // 结构性垃圾行（CSS 残渣 / 纯符号）直接丢弃。
+        if is_junk_line(&collapsed) {
+            continue;
+        }
         if collapsed.is_empty() {
             // 保留段落分隔，但避免连续空行堆积。
             if matches!(out.last(), Some(l) if !l.is_empty()) {
@@ -373,6 +675,10 @@ fn reduce_noise(text: &str) -> String {
         }
         // 丢弃与上一行完全相同的行（促销邮件常见的大段重复条目）。
         if prev_line.as_deref() == Some(collapsed.as_str()) {
+            continue;
+        }
+        // 全局面级去重：重复行从第二次出现起一律丢弃。
+        if !seen.insert(collapsed.clone()) {
             continue;
         }
         prev_line = Some(collapsed.clone());
@@ -387,6 +693,24 @@ fn reduce_noise(text: &str) -> String {
         out.pop();
     }
     out.join("\n")
+}
+
+/// 结构性垃圾行判定：HTML 降级提取的正文里的 CSS 残渣与纯符号行。
+///
+/// - 含 `!important` / `mso-` → CSS 声明残渣；
+/// - 含 `{` 或 `}` → CSS 块残渣（正文里的花括号极罕见）；
+/// - 没有任何字母/数字/汉字（如 `( )`、`****`）→ 图片 alt 占位或装饰线。
+fn is_junk_line(line: &str) -> bool {
+    if line.is_empty() {
+        return false; // 空行承担分段语义，交给调用方处理
+    }
+    if line.contains("!important") || line.contains("mso-") {
+        return true;
+    }
+    if line.contains('{') || line.contains('}') {
+        return true;
+    }
+    !line.chars().any(|c| c.is_alphanumeric())
 }
 
 /// 折叠行内「相邻重复的句子/短语」。
@@ -526,7 +850,7 @@ fn strip_invisible(s: &str) -> String {
     s.chars().filter(|c| !INVISIBLE.contains(c)).collect()
 }
 
-fn format_time(ts: i64) -> String {
+pub(crate) fn format_time(ts: i64) -> String {
     if ts <= 0 {
         return "未知".to_string();
     }
@@ -585,7 +909,7 @@ fn strip_html(html: &str) -> String {
         .join(" ")
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
@@ -677,6 +1001,7 @@ mod tests {
             messages: vec![],
             stream: false,
             think: Some(false),
+            format: None,
             options: ChatOptions {
                 temperature: 0.2,
                 num_predict: 1024,
@@ -697,6 +1022,7 @@ mod tests {
             messages: vec![],
             stream: false,
             think: None,
+            format: None,
             options: ChatOptions {
                 temperature: 0.2,
                 num_predict: 64,
@@ -704,6 +1030,66 @@ mod tests {
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("think"), "None 时不应输出该字段：{json}");
+    }
+
+    /// 分类请求必须带 `"format":"json"`（语法层约束模型输出合法 JSON）。
+    #[test]
+    fn request_body_sets_json_format_when_requested() {
+        let body = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: false,
+            think: Some(false),
+            format: Some("json"),
+            options: ChatOptions {
+                temperature: 0.0,
+                num_predict: 256,
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""format":"json""#), "分类请求应约束 JSON：{json}");
+    }
+
+    /// 摘要请求不带 `format`，保持原有纯文本输出契约。
+    #[test]
+    fn request_body_omits_format_when_none() {
+        let body = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![],
+            stream: false,
+            think: Some(false),
+            format: None,
+            options: ChatOptions {
+                temperature: 0.0,
+                num_predict: 512,
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("format"), "未指定时不应输出该字段：{json}");
+    }
+
+    /// 回归测试（关键）：HTTP 200 空壳响应必须映射为 `ModelBusy` 走自愈，
+    /// 绝不能静默当成「模型判定为空」。
+    ///
+    /// 空壳原文取自本机实测（与复读 500 同源的 runner 病态，curl 直连亦可复现）。
+    #[test]
+    fn empty_shell_response_maps_to_model_busy() {
+        let r = parse(
+            r#"{"model":"","created_at":"0001-01-01T00:00:00Z","message":{"role":"","content":""},"done":false}"#,
+        );
+        let err = extract_content(r, "qwen3.5:9b").expect_err("空壳应报错");
+        assert!(
+            matches!(err, AppError::ModelBusy(_)),
+            "空壳应分类为 ModelBusy 以便自动重试，实际：{err:?}"
+        );
+    }
+
+    /// 模型不存在的响应经 extract_content 应分类为 ModelNotFound（走模型回退）。
+    #[test]
+    fn extract_content_maps_model_not_found() {
+        let r = parse(r#"{"error":"model 'qwen2.5:7b' not found"}"#);
+        let err = extract_content(r, "qwen2.5:7b").expect_err("不应成功");
+        assert!(matches!(err, AppError::ModelNotFound(_)), "应分类为 ModelNotFound：{err:?}");
     }
 
     /// 回归测试：Ollama 的复读保护必须被识别为「可自愈」类错误。
@@ -850,22 +1236,43 @@ mod tests {
         assert!(out.contains("标题") && out.contains("结尾"));
     }
 
-    /// 降噪：删 URL + 折叠重复 + 压缩空白，并去掉首尾空行。
-    ///
-    /// 注意：两个 `A B` 之间隔着一条被清空的 URL 行，构成段落边界，因此**不**折叠
-    /// ——只有字面连续的重复行才会被折叠（见 `reduce_noise_collapses_...`）。
+    /// 降噪：删 URL + 折叠重复 + 压缩空白 + 全局去重 + 去掉首尾空行。
     #[test]
     fn reduce_noise_end_to_end() {
         let src = "\n\n  A   B  \n<https://x.com/1>\nA B\n\n\nC\n\n";
         let out = reduce_noise(src);
-        assert_eq!(out, "A B\n\nA B\n\nC", "降噪结果不符：{out:?}");
+        assert_eq!(out, "A B\n\nC", "降噪结果不符：{out:?}");
     }
 
-    /// URL 行清空后形成的段落边界不应把前后相同文本误判为「连续重复」。
+    /// 全局面级去重：被空行/URL 分隔的重复行（实测的 `( )\n\n( )` 形态）也丢弃
+    /// ——模型会照抄这类重复，仅折叠"连续"重复不够。
     #[test]
-    fn reduce_noise_keeps_text_separated_by_url_line() {
+    fn reduce_noise_dedupes_across_paragraphs() {
         let out = reduce_noise("A B\n<https://x.com/1>\nA B");
-        assert_eq!(out, "A B\n\nA B", "URL 分隔的两段不应被折叠：{out:?}");
+        assert_eq!(out, "A B", "被分隔的重复行应全局去重：{out:?}");
+    }
+
+    /// 结构性垃圾行（CSS 残渣 / 纯符号）直接丢弃；含文字的正文行保留。
+    #[test]
+    fn reduce_noise_drops_css_and_symbol_junk() {
+        let src = "Microsoft Rewards Logo ( )\n\n( )\n\nsup, sub {\nfont-size:100% !important; }\n\n正文第一行\n****\n正文第二行";
+        let out = reduce_noise(src);
+        assert!(
+            out.contains("正文第一行") && out.contains("正文第二行"),
+            "正文应保留：{out:?}"
+        );
+        assert!(
+            out.contains("Microsoft Rewards Logo"),
+            "含文字的图片 alt 行应保留：{out:?}"
+        );
+        assert!(
+            !out.lines().any(|l| l.trim() == "( )" || l.trim() == "****"),
+            "纯符号行应被丢弃：{out:?}"
+        );
+        assert!(
+            !out.contains("!important") && !out.contains("sup, sub {"),
+            "CSS 残渣应被丢弃：{out:?}"
+        );
     }
 
     /// 真实 Steam 类营销邮件应被显著压缩（实测 909 → ~499 字符）。
@@ -876,5 +1283,82 @@ mod tests {
         assert!(out.len() < src.len(), "应被压缩：{} → {}", src.len(), out.len());
         assert!(!out.contains("token="), "长 token URL 应被移除：{out}");
         assert!(out.contains("MECCHA CHAMELEON"), "促销正文应保留：{out}");
+    }
+
+    // ---- 摘要 JSON 解析与组装 ----
+
+    /// 标准英文键的完整载荷。
+    #[test]
+    fn parse_summary_standard_keys() {
+        let raw = r#"{"summary":"会议邀请","points":["10 月 28-29 日","旧金山"],"action":"报名参加"}"#;
+        let p = parse_summary(raw).expect("应解析成功");
+        assert_eq!(p.summary, "会议邀请");
+        assert_eq!(p.points, vec!["10 月 28-29 日", "旧金山"]);
+        assert_eq!(p.action.as_deref(), Some("报名参加"));
+    }
+
+    /// 实测漂移形态：键名变成中文别名（「主题 / 关键要点 / 行动」）。
+    #[test]
+    fn parse_summary_accepts_chinese_aliases() {
+        let raw = r#"{"主题":"领取积分提醒","关键要点":["积分即将过期","尽快兑换"],"行动":"访问网站兑换"}"#;
+        let p = parse_summary(raw).expect("中文别名键应被接住");
+        assert_eq!(p.summary, "领取积分提醒");
+        assert_eq!(p.points.len(), 2);
+        assert_eq!(p.action.as_deref(), Some("访问网站兑换"));
+    }
+
+    /// points 为字符串（换行 + 前缀符号）时按行拆分。
+    #[test]
+    fn parse_summary_points_as_string() {
+        let raw = r#"{"summary":"周报","points":"- 完成 A\n- 进行 B\n\n* 计划 C","action":null}"#;
+        let p = parse_summary(raw).unwrap();
+        assert_eq!(p.points, vec!["完成 A", "进行 B", "计划 C"]);
+        assert_eq!(p.action, None, "null 行动应转 None");
+    }
+
+    /// 实测漂移形态（整封邮件被重排）：summary 从「邮件主题」命中；
+    /// 「邮件正文」是嵌套对象，不得被误当作 points。
+    #[test]
+    fn parse_summary_reorganized_email_still_reads_summary() {
+        let raw = r#"{"邮件主题":"职位推荐","发件人":"51Job","发件时间":"2026-09-23","邮件正文":{"职位":"运维工程师"}}"#;
+        let p = parse_summary(raw).expect("应从「邮件主题」取到 summary");
+        assert_eq!(p.summary, "职位推荐");
+        assert!(p.points.is_empty(), "嵌套正文对象不应作为要点");
+        assert_eq!(p.action, None);
+    }
+
+    #[test]
+    fn parse_summary_missing_or_blank_summary_fails() {
+        assert!(parse_summary(r#"{"points":["a"]}"#).is_none(), "缺 summary 应判失败");
+        assert!(parse_summary(r#"{"summary":"  "}"#).is_none(), "空 summary 应判失败");
+        assert!(parse_summary(r#"{"summary":"无"}"#).is_none(), "占位词应判失败");
+        assert!(parse_summary("not json at all").is_none(), "非法 JSON 应判失败");
+    }
+
+    /// 组装成三节文本（缓存与前端依赖这个格式）。
+    #[test]
+    fn render_summary_composes_three_sections() {
+        let p = SummaryPayload {
+            summary: "账单通知".to_string(),
+            points: vec!["金额 100 元".to_string(), "到期日 10 月 20 日".to_string()],
+            action: Some("尽快缴费".to_string()),
+        };
+        assert_eq!(
+            render_summary(&p),
+            "【一句话概括】账单通知\n【关键信息】\n- 金额 100 元\n- 到期日 10 月 20 日\n【需要我做什么】尽快缴费"
+        );
+    }
+
+    #[test]
+    fn render_summary_without_action_or_points() {
+        let p = SummaryPayload {
+            summary: "纯通知".to_string(),
+            points: vec![],
+            action: None,
+        };
+        assert_eq!(
+            render_summary(&p),
+            "【一句话概括】纯通知\n【关键信息】\n- （无）\n【需要我做什么】无"
+        );
     }
 }

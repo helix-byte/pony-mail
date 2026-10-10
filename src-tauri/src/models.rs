@@ -71,6 +71,8 @@ pub struct Tag {
     pub sort_order: i64,
     /// 该标签下已打标的邮件数，用于侧栏角标。
     pub message_count: i64,
+    /// 创建者：`"user"`（默认）或 `"ai"`（智能整理创建）。AI 标签可在界面区分、用户可删。
+    pub created_by: String,
 }
 
 /// 标签组：可点击筛选的标签合集，组内标签取**并集**（OR）。
@@ -94,6 +96,9 @@ pub struct TagGroup {
     /// 组内标签自身的邮件数之和（含重复计数）。仅用于展示「标签数」以外的参考，
     /// 与 `message_count` 的差值即重叠量。
     pub raw_message_count: i64,
+    /// AI 整理维度模式：`"off"`（默认，不参与）/ `"select"`（从组内现有标签选一个）
+    /// / `"create"`（可从组内选，也可创建新标签并自动入组）。
+    pub ai_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +176,9 @@ pub struct AiStatus {
 pub struct AiSettings {
     pub base_url: String,
     pub model: String,
+    /// 同步完成后自动整理新邮件。缺省视为开启（存量 settings JSON 无此键时由 serde 默认补上）。
+    #[serde(default = "default_true")]
+    pub auto_classify: bool,
 }
 
 impl Default for AiSettings {
@@ -180,6 +188,7 @@ impl Default for AiSettings {
             // 选一个体积适中、中文摘要稳定的通用模型。用户可在「AI 设置」中改；
             // 若本机未安装，生成摘要时会自动回退到第一个可用模型。
             model: "qwen3.5:9b".to_string(),
+            auto_classify: true,
         }
     }
 }

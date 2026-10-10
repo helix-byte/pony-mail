@@ -243,13 +243,13 @@ fn update_group_renames_recolors_and_toggles_collapse() {
     let (store, _dir) = seeded_store();
     let g = store.create_tag_group("acc", "本周", "#8b5cf6", "").unwrap();
 
-    store.update_tag_group(g.id, Some("本月"), Some("#0d9488"), Some(true)).unwrap();
+    store.update_tag_group(g.id, Some("本月"), Some("#0d9488"), Some(true), None).unwrap();
     let all = store.list_tag_groups("acc").unwrap();
     assert_eq!(all[0].name, "本月");
     assert_eq!(all[0].color, "#0d9488");
     assert!(all[0].collapsed, "折叠状态应持久化");
 
-    store.update_tag_group(g.id, None, None, Some(false)).unwrap();
+    store.update_tag_group(g.id, None, None, Some(false), None).unwrap();
     assert!(!store.list_tag_groups("acc").unwrap()[0].collapsed);
 }
 
@@ -259,16 +259,16 @@ fn update_group_rejects_conflicting_name() {
     let a = store.create_tag_group("acc", "本周", "#8b5cf6", "").unwrap();
     let b = store.create_tag_group("acc", "客户", "#a855f7", "").unwrap();
 
-    let err = store.update_tag_group(b.id, Some("本周"), None, None).unwrap_err();
+    let err = store.update_tag_group(b.id, Some("本周"), None, None, None).unwrap_err();
     assert!(err.to_string().contains("已存在"), "重名应被拒绝：{err}");
     // 改成自己原来的名字不算冲突。
-    assert!(store.update_tag_group(a.id, Some("本周"), None, None).is_ok());
+    assert!(store.update_tag_group(a.id, Some("本周"), None, None, None).is_ok());
 }
 
 #[test]
 fn update_missing_group_reports_readable_error() {
     let (store, _dir) = seeded_store();
-    let err = store.update_tag_group(999, Some("任意"), None, None).unwrap_err();
+    let err = store.update_tag_group(999, Some("任意"), None, None, None).unwrap_err();
     assert!(err.to_string().contains("标签组不存在"), "错误应可读：{err}");
 }
 

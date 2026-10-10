@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { useMailStore } from "../stores/mail";
 import { avatarColor, avatarText, formatDateTime, formatSize } from "../utils/format";
@@ -41,6 +42,32 @@ function measure() {
   } catch {
     // 跨源访问受限时保持默认高度
   }
+}
+
+/**
+ * 正文里的链接由外层沙箱接管打开：
+ * iframe 的 sandbox 未授予 allow-popups，`target="_blank"` 的新窗口请求
+ * 会被浏览器静默丢弃，Tauri / WebView2 也不会代开系统浏览器，
+ * 因此在文档上委托监听点击，命中 http(s) / mailto 链接时阻止默认行为，
+ * 交给系统默认应用（浏览器 / 邮件客户端）打开。
+ */
+function bindFrameLinks() {
+  const doc = iframeRef.value?.contentDocument;
+  if (!doc) return;
+  doc.addEventListener("click", (e) => {
+    // e.target 是 iframe realm 的元素，父窗口侧的 `instanceof Element` 判定会失效，
+    // 所以用 closest 做鸭子类型探测。
+    const anchor = (e.target as Element | null)?.closest?.("a") ?? null;
+    const href = anchor?.getAttribute("href")?.trim() ?? "";
+    if (!/^(https?|mailto):/i.test(href)) return;
+    e.preventDefault();
+    void openUrl(href).catch(() => store.toast("打开链接失败，请检查系统默认应用", "error"));
+  });
+}
+
+function onFrameLoad() {
+  bindFrameLinks();
+  measure();
 }
 
 watch(srcdoc, () => {
@@ -249,7 +276,7 @@ function shortAddr(list: string): string {
             sandbox="allow-same-origin"
             :srcdoc="srcdoc"
             :style="{ height: (frameHeight || 560) + 'px' }"
-            @load="measure"
+            @load="onFrameLoad"
           />
         </div>
       </div>

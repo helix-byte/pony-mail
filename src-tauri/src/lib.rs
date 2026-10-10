@@ -30,6 +30,15 @@ use tauri::{Emitter, Manager};
 
 use store::Store;
 
+/// 开机自启启动项的附加参数。注册表值形如 `"C:\...\pony-mail.exe" --autostart`，
+/// 启动时据此识别「自启拉起」：静默驻留系统托盘，不弹出主窗口。
+pub(crate) const AUTOSTART_ARG: &str = "--autostart";
+
+/// 本次启动是否由开机自启拉起。
+fn is_autostart_launch() -> bool {
+    std::env::args().any(|a| a == AUTOSTART_ARG)
+}
+
 /// 全局应用状态，通过 `State<AppState>` 注入到各 command。
 pub struct AppState {
     pub store: Store,
@@ -49,7 +58,11 @@ pub fn run() {
     tauri::Builder::default()
         // 单实例必须最先注册：插件按注册顺序执行，它要在任何建窗逻辑之前
         // 拦下第二实例（第二实例即时退出，回调在第一实例里唤醒窗口）。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // 自启拉起的第二实例（应用已在运行）：保持现状，不打扰用户。
+            if argv.iter().any(|a| a.as_str() == AUTOSTART_ARG) {
+                return;
+            }
             tray::show_main(app);
         }))
         .plugin(tauri_plugin_opener::init())
@@ -58,7 +71,8 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(
             // 仅 macOS 使用；Windows 构建必须照样传（参数为必填）。
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None, // 不带额外启动参数：自启即正常打开主窗口
+            // 自启命令携带 --autostart 参数：启动时据此静默驻留托盘而非弹窗。
+            Some(vec![AUTOSTART_ARG]),
         ))
         .on_window_event(|window, event| tray::on_window_event(window, event))
         .setup(|app| {
@@ -89,6 +103,21 @@ pub fn run() {
                 // 启动即按库中未读数刷新一次 tooltip。
                 tray::refresh(app.handle());
             }
+
+            // 主窗口在 config 中默认隐藏（visible: false），避免开机自启时一闪而过：
+            // 手动启动（无 --autostart 参数）在此显式弹出主窗口；自启拉起则静默驻留托盘。
+            if is_autostart_launch() {
+                log::log_line(app.handle(), "tray", "开机自启：静默启动，驻留系统托盘");
+            } else {
+                log::log_line(app.handle(), "tray", "手动启动：显示主窗口");
+                tray::show_main(app.handle());
+            }
+
+            // 升级自愈（仅正式构建）：旧版本写入的开机自启项（无引号、无自启参数）
+            // 在此原位重写为规范格式，用户无需重新开关一次；用户在任务管理器
+            // 禁用的启动项（is_enabled 为 false）不会被触碰。
+            #[cfg(windows)]
+            commands::ensure_autostart_value(app.handle());
 
             // 启动后延迟自动检查更新：避开启动高峰（IMAP 监听/同步相继起步）；
             // 仅正式构建触发；发现新版本且未被跳过时推送 update:available 事件。

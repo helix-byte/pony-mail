@@ -10,6 +10,8 @@ const baseUrl = ref("http://localhost:11434");
 const model = ref("qwen3.5:9b");
 /** 同步完成后自动整理新邮件（缺省开启）。 */
 const autoClassify = ref(true);
+/** 打开邮件时自动生成摘要（缺省开启）。 */
+const autoSummarize = ref(true);
 const models = ref<string[]>([]);
 const online = ref(false);
 const message = ref("");
@@ -22,6 +24,7 @@ onMounted(async () => {
     baseUrl.value = s.baseUrl;
     model.value = s.model;
     autoClassify.value = s.autoClassify;
+    autoSummarize.value = s.autoSummarize;
   } catch (e) {
     store.toast(errorText(e), "error");
   }
@@ -53,6 +56,7 @@ async function save() {
       baseUrl: baseUrl.value.trim(),
       model: model.value.trim(),
       autoClassify: autoClassify.value,
+      autoSummarize: autoSummarize.value,
     });
     // 刷新 store 缓存：自动整理开关立即生效（sync 完成后读取的正是它）。
     void store.loadAiSettings();
@@ -128,6 +132,17 @@ async function save() {
             <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
               同步收件箱后，自动用本地模型为未整理的邮件打标签。
               在左侧「标签」区域编辑标签组时，可选择哪些组交给 AI 整理。
+            </span>
+          </span>
+        </label>
+
+        <label class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <input v-model="autoSummarize" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500" />
+          <span class="min-w-0">
+            <span class="block text-[12.5px] text-zinc-300">打开邮件时自动生成摘要</span>
+            <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
+              点开邮件后自动用本地模型提炼要点；命中缓存的邮件直接展示已有摘要，不会重复推理。
+              关闭后仍可在阅读区手动点击「生成摘要」。
             </span>
           </span>
         </label>

@@ -194,7 +194,7 @@ function shortAddr(list: string): string {
         <!-- AI 摘要 -->
         <div class="px-6 pt-4">
           <div
-            v-if="!store.summary && !store.summaryLoading && !store.summaryError"
+            v-if="!store.summary && !store.summaryLoading && !store.summaryPending && !store.summaryError"
             class="flex items-center gap-3 rounded-xl border border-line bg-panel px-4 py-3"
           >
             <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600">
@@ -228,7 +228,7 @@ function shortAddr(list: string): string {
               <div class="ml-auto flex items-center gap-2">
                 <button
                   class="text-[11.5px] text-zinc-500 transition hover:text-indigo-300"
-                  :disabled="store.summaryLoading"
+                  :disabled="store.summaryLoading || store.summaryPending"
                   @click="store.summarize(true)"
                 >
                   重新生成
@@ -236,7 +236,7 @@ function shortAddr(list: string): string {
               </div>
             </div>
 
-            <p v-if="store.summaryLoading" class="mt-2.5 flex items-center gap-2 text-[12.5px] text-zinc-400">
+            <p v-if="store.summaryLoading || store.summaryPending" class="mt-2.5 flex items-center gap-2 text-[12.5px] text-zinc-400">
               <span class="h-3 w-3 animate-spin rounded-full border-[1.5px] border-indigo-400 border-t-transparent" />
               本地模型推理中，7B 模型通常需要几秒…
             </p>

@@ -32,6 +32,8 @@ npm run tauri dev        # 开发模式（前端热更新 + Rust 自动重编译
 npm run tauri build      # 打包 NSIS 安装包，产物在 src-tauri/target/release/bundle/nsis/
 ```
 
+应用图标源文件在 `assets/app-icon.svg`（手写矢量图）；修改后运行 `npm run tauri icon assets/app-icon.svg` 重新生成 `src-tauri/icons/` 全套图标。
+
 国内网络下首次打包若卡在下载 NSIS 工具链，可设置 GitHub 镜像后重试：
 
 ```bash

@@ -215,6 +215,28 @@ impl Default for MailSettings {
     }
 }
 
+/// 更新检查设置。与 AI / 邮件设置分开存储（独立 settings 键）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSettings {
+    /// 启动后自动检查更新。缺省开启——存量 settings JSON 无此键时由 serde 默认补上，
+    /// 保证老用户升级后能收到新版本提醒。
+    #[serde(default = "default_true")]
+    pub auto_check: bool,
+    /// 已跳过的版本号：自动检查不再提示它（手动检查仍显示）。空串 = 未跳过。
+    #[serde(default)]
+    pub skipped_version: String,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            skipped_version: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendPayload {
@@ -297,5 +319,31 @@ mod tests {
         assert!(!s.notify_new_mail, "显式关闭必须被尊重");
         let out = serde_json::to_string(&s).unwrap();
         assert!(out.contains("\"notifyNewMail\":false"));
+    }
+
+    #[test]
+    fn update_settings_default_enables_auto_check() {
+        let s = UpdateSettings::default();
+        assert!(s.auto_check);
+        assert!(s.skipped_version.is_empty());
+    }
+
+    #[test]
+    fn update_settings_legacy_json_defaults_auto_check_true() {
+        // 存量 settings JSON 没有 autoCheck 键，反序列化必须补默认开启，
+        // 否则老用户升级后更新提醒会被静默关掉。
+        let s: UpdateSettings = serde_json::from_str("{}").expect("空 JSON 应可反序列化");
+        assert!(s.auto_check, "缺省键应默认开启自动检查更新");
+        assert!(s.skipped_version.is_empty());
+    }
+
+    #[test]
+    fn update_settings_explicit_values_roundtrip() {
+        let raw = r#"{"autoCheck":false,"skippedVersion":"0.2.0"}"#;
+        let s: UpdateSettings = serde_json::from_str(raw).unwrap();
+        assert!(!s.auto_check, "显式关闭必须被尊重");
+        assert_eq!(s.skipped_version, "0.2.0");
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"skippedVersion\":\"0.2.0\""));
     }
 }

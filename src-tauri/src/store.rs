@@ -1507,6 +1507,17 @@ impl Store {
         self.set_setting("mail", &serde_json::to_string(s)?)
     }
 
+    pub fn update_settings(&self) -> AppResult<UpdateSettings> {
+        let raw = self.get_setting("update")?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<UpdateSettings>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_update_settings(&self, s: &UpdateSettings) -> AppResult<()> {
+        self.set_setting("update", &serde_json::to_string(s)?)
+    }
+
     // ------------------------------------------------------------------
     // 邮件路由
     // ------------------------------------------------------------------

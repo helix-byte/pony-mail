@@ -14,6 +14,8 @@ import type {
   Summary,
   Tag,
   TagGroup,
+  UpdateInfo,
+  UpdateSettings,
   WatchStateEvent,
 } from "../api/types";
 import { formatDateTime } from "../utils/format";
@@ -104,6 +106,7 @@ export const useMailStore = defineStore("mail", () => {
     composeOpen: false,
     accountOpen: false,
     settingsOpen: false,
+    updateOpen: false,
     composeDraft: null as ComposeDraft | null,
   });
   const busy = reactive({
@@ -642,6 +645,82 @@ export const useMailStore = defineStore("mail", () => {
   }
 
   // ------------------------------------------------------------------
+  // 更新检查
+  // ------------------------------------------------------------------
+
+  /** 最新一次检查结果（null = 尚无结果）。 */
+  const updateInfo = ref<UpdateInfo | null>(null);
+  /** 更新偏好缓存（自动检查开关、已跳过版本）。 */
+  const updateSettings = ref<UpdateSettings | null>(null);
+  /** 手动检查进行中（设置页按钮据此禁用）。 */
+  const updateChecking = ref(false);
+
+  /** 拉取更新偏好（失败静默——设置读取异常不该打断主流程）。 */
+  async function loadUpdateSettings() {
+    try {
+      updateSettings.value = await api.getUpdateSettings();
+    } catch {
+      // 保持 null，按默认值（自动检查开启、未跳过任何版本）处理。
+    }
+  }
+
+  /**
+   * 手动检查更新（设置页入口）。force=true 忽略「跳过此版本」。
+   * 失败时 toast 并返回 null；成功返回结果并写入 updateInfo。
+   */
+  async function checkUpdate(): Promise<UpdateInfo | null> {
+    if (updateChecking.value) return null;
+    updateChecking.value = true;
+    try {
+      const info = await api.checkUpdate(true);
+      updateInfo.value = info;
+      return info;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return null;
+    } finally {
+      updateChecking.value = false;
+    }
+  }
+
+  /** 跳过某个版本：写入偏好，自动检查不再提示它（手动检查仍显示）。 */
+  async function skipVersion(version: string) {
+    try {
+      // 以后端为准现读一次：缓存缺失或过期时，直接写盘会把「自动检查开关」等字段覆盖回旧值。
+      const current = await api.getUpdateSettings();
+      updateSettings.value = { ...current, skippedVersion: version };
+      await api.setUpdateSettings(updateSettings.value);
+      toast(`已跳过 v${version} 的更新提示，可在「设置」中手动检查`, "info");
+    } catch (e) {
+      toast(errorText(e), "error");
+    }
+  }
+
+  /** 监听事件是否已接入（initUpdater 幂等保护）。 */
+  let updaterReady = false;
+
+  /**
+   * 接入后端更新事件（启动时调用一次，幂等）。
+   *
+   * 自动检查在 Rust 侧启动后延迟触发；发现新版本时推送 `update:available`，
+   * 这里落库到状态并弹出更新对话框。
+   */
+  async function initUpdater() {
+    if (updaterReady) return;
+    updaterReady = true;
+    try {
+      await listen<UpdateInfo>("update:available", (e) => {
+        updateInfo.value = e.payload;
+        ui.updateOpen = true;
+      });
+      void loadUpdateSettings();
+    } catch (e) {
+      updaterReady = false;
+      toast(errorText(e), "error");
+    }
+  }
+
+  // ------------------------------------------------------------------
   // 阅读
   // ------------------------------------------------------------------
 
@@ -1147,6 +1226,14 @@ export const useMailStore = defineStore("mail", () => {
     watchStates,
     activeWatch,
     initRealtime,
+    // ---- 更新 ----
+    updateInfo,
+    updateSettings,
+    updateChecking,
+    loadUpdateSettings,
+    checkUpdate,
+    skipVersion,
+    initUpdater,
     resetReader,
     openMessage,
     setSeen,

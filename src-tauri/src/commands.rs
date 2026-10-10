@@ -14,6 +14,7 @@ use crate::error::{AppError, AppResult};
 use crate::mail::{imap_client, smtp_client};
 use crate::models::*;
 use crate::store::GroupAssignment;
+use crate::update::{self, UpdateInfo};
 use crate::watcher;
 use crate::AppState;
 
@@ -194,6 +195,38 @@ pub fn get_mail_settings(state: State<'_, AppState>) -> AppResult<MailSettings> 
 #[tauri::command]
 pub fn set_mail_settings(state: State<'_, AppState>, settings: MailSettings) -> AppResult<()> {
     state.store.save_mail_settings(&settings)
+}
+
+// ---------------------------------------------------------------------
+// 更新检查
+// ---------------------------------------------------------------------
+
+/// 检查更新：并发查询 Gitee / GitHub 的最新 Release（`force=true` 忽略「跳过此版本」）。
+///
+/// 手动检查（设置页按钮）直接调本命令取结果；自动检查在 `lib.rs` 启动后延迟
+/// 触发，走 `update:available` 事件推送。
+#[tauri::command]
+pub async fn check_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    force: bool,
+) -> AppResult<UpdateInfo> {
+    let current = app.package_info().version.to_string();
+    // 先同步读设置，再发起网络请求（settings 读为短操作，不入 await 窗口）。
+    let settings = state.store.update_settings()?;
+    let mut info = update::check(&app, &state.http, &current).await?;
+    info.apply_skip(&settings.skipped_version, force);
+    Ok(info)
+}
+
+#[tauri::command]
+pub fn get_update_settings(state: State<'_, AppState>) -> AppResult<UpdateSettings> {
+    state.store.update_settings()
+}
+
+#[tauri::command]
+pub fn set_update_settings(state: State<'_, AppState>, settings: UpdateSettings) -> AppResult<()> {
+    state.store.save_update_settings(&settings)
 }
 
 /// 各账号监听状态的最新快照。

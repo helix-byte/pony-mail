@@ -12,7 +12,6 @@
 //! 诊断：线程会把时间线（连接、取信、通知、重连）追加写入应用数据目录的
 //! `pony-watch.log`，排查「新邮件到达慢」先看它。
 
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -503,30 +502,8 @@ fn grow(backoff: Duration) -> Duration {
 /// stderr，并同时开启 vendored imap 的逐行协议日志（S:/C:，同样带时间戳），
 /// 便于把延迟精确归因到某个协议环节。
 fn watch_log(app: &AppHandle, msg: &str) {
-    let stamp = chrono::Local::now().format("%m-%d %H:%M:%S%.3f");
-    if std::env::var_os("PONY_IMAP_DEBUG").is_some() {
-        eprintln!("[watch {stamp}] {msg}");
-    }
-    let Ok(dir) = app.path().app_data_dir() else {
-        return;
-    };
-    let path = dir.join("pony-watch.log");
-    // 体积检查每个进程只做一次，避免每次写日志都 stat。
-    static SIZE_CHECKED: AtomicBool = AtomicBool::new(false);
-    if !SIZE_CHECKED.swap(true, Ordering::Relaxed) {
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > 2 * 1024 * 1024 {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "[watch {stamp}] {msg}");
-    }
+    // 写入逻辑已抽到 crate::log，更新检查等其他模块共用同一日志文件。
+    crate::log::log_line(app, "watch", msg);
 }
 
 #[cfg(test)]

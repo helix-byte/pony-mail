@@ -28,6 +28,13 @@ tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 # 开机自启（Windows 写 HKCU 的 Run 启动项）。仅从 Rust 侧使用，无需前端包与 capability。
 tauri-plugin-autostart = "2"
+
+# 开机自启的 Run 值修正：auto-launch 写入的路径不带引号，含空格的安装路径
+# （如 D:\Programs\Mine\Pony Mail）会被 Windows 解析失败并静默清理条目
+# （tauri-apps/plugins-workspace#1804）。enable 后据此重写为带引号形式。
+# 版本与 auto-launch 0.6.0 的依赖一致，复用同一编译产物。
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

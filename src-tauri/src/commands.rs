@@ -274,7 +274,39 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
             "{}开机自启失败：{e}",
             if enabled { "启用" } else { "关闭" }
         ))
-    })
+    })?;
+
+    // 上游 auto-launch 写出的 Run 值不带引号，安装路径含空格时（如 D:\Programs\Mine\Pony Mail）
+    // 登录启动会被 Windows 解析失败并静默清理条目。启用后重写为带引号形式；
+    // 重写失败则回滚，避免留下「看似启用、实际无效」的启动项。
+    #[cfg(windows)]
+    if enabled {
+        let name = app.package_info().name.clone();
+        let exe = std::env::current_exe()
+            .map_err(|e| AppError::Other(format!("读取程序路径失败：{e}")))?;
+        if let Err(msg) = quote_autostart_path(&name, &exe) {
+            let _ = app.autolaunch().disable();
+            return Err(AppError::Other(format!("启用开机自启失败：{msg}")));
+        }
+    }
+
+    Ok(())
+}
+
+/// 把 Run 启动项的值重写为带引号的路径（`"C:\...\pony-mail.exe"`）。
+#[cfg(windows)]
+fn quote_autostart_path(name: &str, exe: &std::path::Path) -> Result<(), String> {
+    // 需要 read+write：仅 write 的句柄不含 KEY_QUERY_VALUE，读数会被拒。
+    let key = windows_registry::CURRENT_USER
+        .options()
+        .read()
+        .write()
+        .open(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+        .map_err(|e| format!("打开启动项注册表失败：{e}"))?;
+    key.get_string(name)
+        .map_err(|e| format!("启动项未被写入：{e}"))?;
+    key.set_string(name, format!("\"{}\"", exe.display()))
+        .map_err(|e| format!("重写启动项失败：{e}"))
 }
 
 /// 各账号监听状态的最新快照。

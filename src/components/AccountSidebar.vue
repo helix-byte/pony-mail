@@ -419,6 +419,15 @@ const ungroupedTags = computed(() => {
                         <path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" stroke-linecap="round" stroke-linejoin="round" />
                       </svg>
                     </span>
+                    <span
+                      class="rounded p-1 text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-400"
+                      title="删除标签"
+                      @click.stop="onDeleteTag(t!.id, t!.name)"
+                    >
+                      <svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M6 6l12 12M18 6L6 18" stroke-linecap="round" />
+                      </svg>
+                    </span>
                   </span>
                 </button>
               </div>
@@ -457,6 +466,15 @@ const ungroupedTags = computed(() => {
                   {{ t.messageCount }}
                 </span>
                 <span class="absolute right-1.5 flex shrink-0 items-center gap-0.5 opacity-0 transition group-hover/tag:opacity-100">
+                  <span
+                    class="rounded p-1 text-zinc-500 transition hover:bg-panel hover:text-zinc-200"
+                    title="编辑标签"
+                    @click.stop="openEdit(t.id)"
+                  >
+                    <svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </span>
                   <span
                     class="rounded p-1 text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-400"
                     title="删除标签"

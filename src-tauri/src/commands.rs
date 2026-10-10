@@ -277,14 +277,17 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
     })?;
 
     // 上游 auto-launch 写出的 Run 值不带引号，安装路径含空格时（如 D:\Programs\Mine\Pony Mail）
-    // 登录启动会被 Windows 解析失败并静默清理条目。启用后重写为带引号形式；
+    // 登录启动会被 Windows 解析失败并静默清理条目。启用后重写为规范格式；
     // 重写失败则回滚，避免留下「看似启用、实际无效」的启动项。
     #[cfg(windows)]
     if enabled {
         let name = app.package_info().name.clone();
         let exe = std::env::current_exe()
             .map_err(|e| AppError::Other(format!("读取程序路径失败：{e}")))?;
-        if let Err(msg) = quote_autostart_path(&name, &exe) {
+        // 先确认插件已写入（能读到值即视为已写入），再原位重写为规范格式。
+        let rewritten =
+            read_run_value(&name).and_then(|_| write_run_value(&name, &autostart_value(&exe)));
+        if let Err(msg) = rewritten {
             let _ = app.autolaunch().disable();
             return Err(AppError::Other(format!("启用开机自启失败：{msg}")));
         }
@@ -293,20 +296,72 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> AppResult<()> {
     Ok(())
 }
 
-/// 把 Run 启动项的值重写为带引号的路径（`"C:\...\pony-mail.exe"`）。
+/// 开机自启启动项的目标格式：`"C:\...\pony-mail.exe" --autostart`。
+/// 路径必须带引号（含空格的安装路径否则会被系统解析失败并静默清理）；
+/// 附带 `--autostart` 参数供启动时识别，静默驻留系统托盘不弹窗。
 #[cfg(windows)]
-fn quote_autostart_path(name: &str, exe: &std::path::Path) -> Result<(), String> {
-    // 需要 read+write：仅 write 的句柄不含 KEY_QUERY_VALUE，读数会被拒。
-    let key = windows_registry::CURRENT_USER
+fn autostart_value(exe: &std::path::Path) -> String {
+    format!("\"{}\" {}", exe.display(), crate::AUTOSTART_ARG)
+}
+
+/// 升级自愈（仅正式构建）：开机自启处于启用状态但 Run 值不是规范格式时
+/// （旧版本写入的无引号值，或缺 `--autostart` 参数）原位重写。
+/// 用户经任务管理器禁用的启动项 is_enabled 为 false，不会被触碰。
+#[cfg(windows)]
+pub fn ensure_autostart_value(app: &AppHandle) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    if !matches!(app.autolaunch().is_enabled(), Ok(true)) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let name = app.package_info().name.clone();
+    let expected = autostart_value(&exe);
+    let Ok(current) = read_run_value(&name) else {
+        return;
+    };
+    if current == expected {
+        return;
+    }
+    match write_run_value(&name, &expected) {
+        Ok(()) => crate::log::log_line(
+            app,
+            "autostart",
+            "启动项已重写为带引号并携带 --autostart 参数",
+        ),
+        Err(e) => crate::log::log_line(app, "autostart", &format!("启动项自愈失败：{e}")),
+    }
+}
+
+/// 读取当前用户 Run 启动项中指定名称的值。
+#[cfg(windows)]
+fn read_run_value(name: &str) -> Result<String, String> {
+    let key = open_run_key()?;
+    key.get_string(name)
+        .map_err(|e| format!("读取启动项失败：{e}"))
+}
+
+/// 写入当前用户 Run 启动项中指定名称的值。
+#[cfg(windows)]
+fn write_run_value(name: &str, value: &str) -> Result<(), String> {
+    let key = open_run_key()?;
+    key.set_string(name, value)
+        .map_err(|e| format!("写入启动项失败：{e}"))
+}
+
+/// 打开当前用户 Run 键。需要 read+write：仅 write 的句柄不含
+/// KEY_QUERY_VALUE，读数会被拒（0x80070005）。
+#[cfg(windows)]
+fn open_run_key() -> Result<windows_registry::Key, String> {
+    windows_registry::CURRENT_USER
         .options()
         .read()
         .write()
         .open(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
-        .map_err(|e| format!("打开启动项注册表失败：{e}"))?;
-    key.get_string(name)
-        .map_err(|e| format!("启动项未被写入：{e}"))?;
-    key.set_string(name, format!("\"{}\"", exe.display()))
-        .map_err(|e| format!("重写启动项失败：{e}"))
+        .map_err(|e| format!("打开启动项注册表失败：{e}"))
 }
 
 /// 各账号监听状态的最新快照。

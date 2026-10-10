@@ -191,7 +191,7 @@ async function save() {
           <span class="min-w-0">
             <span class="block text-[12.5px] text-zinc-300">开机自动启动</span>
             <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
-              登录 Windows 后自动在后台启动 Pony Mail，持续实时收信。
+              登录 Windows 后自动在后台静默启动（不弹出窗口，直接驻留系统托盘），持续实时收信。
               写入当前用户的启动项，无需管理员权限。
             </span>
           </span>

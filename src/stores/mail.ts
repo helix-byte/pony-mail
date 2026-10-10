@@ -660,6 +660,9 @@ export const useMailStore = defineStore("mail", () => {
       if (activeMessageId.value === id) {
         resetReader();
       }
+      // 标签与组角标按 message_tags 实时聚合，删除清掉打标关系后必须重拉，否则角标虚高。
+      void loadTags();
+      void loadGroups();
       if (report.deletedRemote) {
         toast("邮件已删除", "ok");
       } else {
@@ -685,6 +688,9 @@ export const useMailStore = defineStore("mail", () => {
       if (activeMessageId.value !== null && idSet.has(activeMessageId.value)) {
         resetReader();
       }
+      // 同 deleteMessage：批量删除同样清掉 message_tags，标签与组角标要重拉刷新。
+      void loadTags();
+      void loadGroups();
       if (report.deletedRemote) {
         toast(`已删除 ${report.deletedLocal} 封邮件`, "ok");
       } else {

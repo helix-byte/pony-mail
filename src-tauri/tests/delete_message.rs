@@ -1,7 +1,8 @@
 //! 删除邮件功能的数据层集成测试。
 //!
 //! 直接驱动 `Store` 的删除原语，验证 `commands::delete_message` 所依赖的
-//! 三条不变量：邮件行被删除、摘要缓存被级联清理、文件夹计数被同步。
+//! 四条不变量：邮件行被删除、摘要缓存被级联清理、文件夹计数被同步、
+//! 打标关系随邮件清理（标签角标是实时聚合，漏清理会虚高）。
 //!
 //! 运行：`cargo test --test delete_message`
 
@@ -95,6 +96,46 @@ fn delete_message_on_missing_id_returns_false() {
 }
 
 #[test]
+fn delete_message_clears_tag_links_and_decrements_counts() {
+    let (store, _dir) = seeded_store();
+
+    let tag = store.create_tag("acc", "工作", "#6366f1", "").unwrap();
+    store.attach_tag(1, tag.id, "").unwrap();
+    store.attach_tag(2, tag.id, "").unwrap();
+    assert_eq!(
+        store.list_tags("acc").unwrap()[0].message_count,
+        2,
+        "前置条件：两封邮件都应挂在标签下"
+    );
+
+    store.delete_message(1).unwrap();
+
+    // 打标关系随邮件清理，标签计数（实时聚合）随之下降。
+    let links_left = store
+        .raw_conn_for_test()
+        .query_row(
+            "SELECT COUNT(*) FROM message_tags WHERE message_id = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(links_left, 0, "打标关系应随邮件一起删除");
+    assert_eq!(
+        store.list_tags("acc").unwrap()[0].message_count,
+        1,
+        "标签计数应随删除下降"
+    );
+
+    // 删掉最后一封挂着该标签的邮件 → 计数必须归零（不得留下虚幻角标）。
+    store.delete_message(2).unwrap();
+    assert_eq!(
+        store.list_tags("acc").unwrap()[0].message_count,
+        0,
+        "标签下没有邮件时计数应为 0"
+    );
+}
+
+#[test]
 fn refresh_folder_count_syncs_drifted_counter() {
     let (store, _dir) = seeded_store();
 
@@ -127,6 +168,11 @@ fn refresh_folder_count_syncs_drifted_counter() {
 fn delete_messages_batch_removes_all_and_reports_count() {
     let (store, _dir) = seeded_store();
 
+    // 两封都打上标签，批量删除后打标关系与标签计数都要归零。
+    let tag = store.create_tag("acc", "工作", "#6366f1", "").unwrap();
+    store.attach_tag(1, tag.id, "").unwrap();
+    store.attach_tag(2, tag.id, "").unwrap();
+
     let removed = store.delete_messages(&[1, 2]).unwrap();
     assert_eq!(removed, 2, "批量删除应返回实际删除行数");
     assert_eq!(store.count_messages("acc", "INBOX").unwrap(), 0);
@@ -136,6 +182,12 @@ fn delete_messages_batch_removes_all_and_reports_count() {
         .query_row("SELECT COUNT(*) FROM ai_cache", [], |r| r.get::<_, i64>(0))
         .unwrap();
     assert_eq!(cache_left, 0, "两封邮件的摘要缓存都应被清理");
+
+    assert_eq!(
+        store.list_tags("acc").unwrap()[0].message_count,
+        0,
+        "批量删除后标签计数应归零"
+    );
 }
 
 #[test]

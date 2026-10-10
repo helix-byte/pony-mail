@@ -99,7 +99,8 @@ if (rawAssets.length === 0) {
 const assets = rawAssets.map((name) => {
   const buf = readFileSync(resolve(assetDir, name));
   return {
-    name: name.replace(/\s+/g, "-"),
+    // 空格替换为 "."：与 tauri-action 上传到 GitHub 的资产命名保持一致。
+    name: name.replace(/\s+/g, "."),
     buf,
     sha: createHash("sha256").update(buf).digest("hex"),
   };

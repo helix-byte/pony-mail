@@ -313,22 +313,9 @@ pub fn parse_classify(raw: &str, groups: &[DimensionGroup]) -> Option<ParsedClas
     Some(ParsedClassify { picks })
 }
 
-/// 提取第一个 JSON 对象：剥 ```` ```json ```` / ```` ``` ```` 围栏，取首 `{` 到末 `}`。
-///
-/// `format:"json"` 下通常用不到，作为兜底保留。
+/// 提取第一个 JSON 对象（与摘要链路共用 `ai::extract_json_object`）。
 fn extract_json_object(raw: &str) -> Option<&str> {
-    let t = raw.trim();
-    let t = t
-        .strip_prefix("```json")
-        .or_else(|| t.strip_prefix("```"))
-        .unwrap_or(t);
-    let t = t.strip_suffix("```").unwrap_or(t);
-    let start = t.find('{')?;
-    let end = t.rfind('}')?;
-    if end < start {
-        return None;
-    }
-    Some(&t[start..=end])
+    crate::ai::extract_json_object(raw)
 }
 
 /// 键名匹配：精确 → 去尾部冒号 → 双向包含取长度最近（键 ≥2 字）。

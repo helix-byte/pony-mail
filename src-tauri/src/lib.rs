@@ -5,7 +5,8 @@ pub mod models;
 pub mod schema;
 /// 对集成测试可见（tests/ 下需要直接驱动删除等数据层逻辑）。
 pub mod store;
-mod ai;
+/// 对集成测试/示例工具可见（examples/ 下需要驱动真实摘要链路）。
+pub mod ai;
 /// 对集成测试可见（tests/ 下需要构造整理结果与维度组）。
 pub mod classify;
 mod commands;

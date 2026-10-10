@@ -20,6 +20,8 @@ indexmap = { version = "1.9", features = ["std"] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# 新邮件到达时的系统通知（Windows toast）。仅从 Rust 侧使用，无需前端包与 capability。
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -16,6 +16,8 @@ onMounted(() => {
   void store.loadAccounts();
   // AI 设置（含「同步后自动整理」开关）在启动时并入缓存。
   void store.loadAiSettings();
+  // 实时收信：接入新邮件与监听状态事件（此后常驻，无需重复调用）。
+  void store.initRealtime();
 });
 </script>
 

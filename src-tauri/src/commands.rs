@@ -4,7 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::Serialize;
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{AppHandle, State};
 use uuid::Uuid;
 
 use crate::ai;
@@ -14,6 +14,7 @@ use crate::error::{AppError, AppResult};
 use crate::mail::{imap_client, smtp_client};
 use crate::models::*;
 use crate::store::GroupAssignment;
+use crate::watcher;
 use crate::AppState;
 
 // ---------------------------------------------------------------------
@@ -26,14 +27,23 @@ pub fn list_accounts(state: State<'_, AppState>) -> AppResult<Vec<Account>> {
 }
 
 #[tauri::command]
-pub fn add_account(state: State<'_, AppState>, input: AccountInput) -> AppResult<Account> {
+pub fn add_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: AccountInput,
+) -> AppResult<Account> {
     let id = Uuid::new_v4().to_string();
     let created_at = Utc::now().to_rfc3339();
 
     // 先写凭据再写库，任一步失败都清理，避免出现「有账号无密码」的脏状态
     credentials::save_password(&id, &input.password)?;
     match state.store.insert_account(&id, &input, &created_at) {
-        Ok(account) => Ok(account),
+        Ok(account) => {
+            // 账号就绪即开始实时收信：监听线程会静默补齐最近一批邮件，
+            // 无需用户再手动点一次同步。
+            watcher::start(&app, account.id.clone());
+            Ok(account)
+        }
         Err(e) => {
             let _ = credentials::delete_password(&id);
             Err(e)
@@ -42,15 +52,24 @@ pub fn add_account(state: State<'_, AppState>, input: AccountInput) -> AppResult
 }
 
 #[tauri::command]
-pub fn delete_account(state: State<'_, AppState>, id: String) -> AppResult<()> {
+pub fn delete_account(app: AppHandle, state: State<'_, AppState>, id: String) -> AppResult<()> {
+    // 先停监听，避免线程继续用已删除的账号重连。
+    watcher::stop(&app, &id);
     state.store.delete_account(&id)?;
     credentials::delete_password(&id)?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_account_password(id: String, password: String) -> AppResult<()> {
-    credentials::save_password(&id, &password)
+pub fn set_account_password(
+    app: AppHandle,
+    id: String,
+    password: String,
+) -> AppResult<()> {
+    credentials::save_password(&id, &password)?;
+    // 重启监听：旧线程可能正拿着旧密码在退避重连，不重启会一直失败到下次冷启动。
+    watcher::start(&app, id);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -161,6 +180,35 @@ fn sync_folder(
         inserted,
         total_on_server,
     })
+}
+
+// ---------------------------------------------------------------------
+// 实时收信设置与监听状态
+// ---------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_mail_settings(state: State<'_, AppState>) -> AppResult<MailSettings> {
+    state.store.mail_settings()
+}
+
+#[tauri::command]
+pub fn set_mail_settings(state: State<'_, AppState>, settings: MailSettings) -> AppResult<()> {
+    state.store.save_mail_settings(&settings)
+}
+
+/// 各账号监听状态的最新快照。
+///
+/// 前端启动时先查一次对齐（早期事件可能在页面监听挂上之前就已广播），
+/// 此后靠 `mail:watch-state` 事件增量更新。
+#[tauri::command]
+pub fn watch_states(state: State<'_, AppState>) -> Vec<watcher::WatchStateEvent> {
+    state
+        .watch_states
+        .lock()
+        .expect("watch_states 锁中毒")
+        .values()
+        .cloned()
+        .collect()
 }
 
 /// 列邮件；传 `tag_ids` 时只返回打过其中**任一**标签的邮件（OR 语义，筛选在 SQL 层完成）。

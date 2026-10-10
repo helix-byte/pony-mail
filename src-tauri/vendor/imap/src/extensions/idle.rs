@@ -54,6 +54,16 @@ pub trait SetReadTimeout {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()>;
 }
 
+/// IDLE 生命周期关键节点的调试日志（`PONY_IMAP_DEBUG` 开启时输出到 stderr）。
+///
+/// 配合 client.rs 带时间戳的 S:/C: 协议日志，用于定位「新邮件到达慢在哪个环节」：
+/// 服务器推送 → DONE 收尾 → （调用方）SEARCH/FETCH。
+fn debug_log(msg: &str) {
+    if std::env::var_os("PONY_IMAP_DEBUG").is_some() {
+        eprintln!("[idle {}] {msg}", chrono::Local::now().format("%H:%M:%S%.3f"));
+    }
+}
+
 impl<'a, T: Read + Write + 'a> Handle<'a, T> {
     pub(crate) fn make(session: &'a mut Session<T>) -> Result<Self> {
         let mut h = Handle {
@@ -69,22 +79,47 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
         // https://tools.ietf.org/html/rfc2177
         //
         // The IDLE command takes no arguments.
-        self.session.run_command("IDLE")?;
-
-        // A tagged response will be sent either
         //
-        //   a) if there's an error, or
-        //   b) *after* we send DONE
-        let mut v = Vec::new();
-        self.session.readline(&mut v)?;
-        if v.starts_with(b"+") {
-            self.done = false;
-            return Ok(());
-        }
+        // 先标记 done：从发出 IDLE 起，任何失败路径都不再走 Drop 里的 DONE 收尾——
+        // 那条路径的读没有超时，对端异常时会永久阻塞；失败会话由调用方整体丢弃重连。
+        // 成功进入 IDLE 时会在下面把 done 置回 false。
+        self.done = true;
+        self.session.run_command("IDLE")?;
+        let t0 = std::time::Instant::now();
+        self.wait_continuation()?;
+        debug_log(&format!("已进入 IDLE（等待续行 {:?}）", t0.elapsed()));
+        self.done = false;
+        Ok(())
+    }
 
-        self.session.read_response_onto(&mut v)?;
-        // We should *only* get a continuation on an error (i.e., it gives BAD or NO).
-        unreachable!();
+    /// 等待 IDLE 的续行 `+ idling`。
+    ///
+    /// 续行前可能夹带不受控的 untagged 行（如 Dovecot 的 `* OK Still here`、
+    /// 恰逢其时的新邮件通知），逐行读直到看见续行。
+    ///
+    /// 若读到 tagged 响应（如 `tag NO ...`），说明服务器拒绝了 IDLE。
+    /// 上游这里直接 `unreachable!()`——本仓库 release 构建 panic=abort，
+    /// 一旦触发会崩掉整个应用；改为返回错误，让调用方断开重连。
+    fn wait_continuation(&mut self) -> Result<()> {
+        loop {
+            let mut line = Vec::new();
+            self.session.readline(&mut line)?;
+            if line.starts_with(b"+") {
+                return Ok(());
+            }
+            if let Ok((_, imap_proto::Response::Done { .. })) = imap_proto::parse_response(&line)
+            {
+                debug_log(&format!(
+                    "服务器拒绝 IDLE：{}",
+                    String::from_utf8_lossy(&line).trim_end()
+                ));
+                return Err(Error::Bad("服务器拒绝 IDLE 命令".to_string()));
+            }
+            debug_log(&format!(
+                "续行前收到 untagged 行，继续等待：{}",
+                String::from_utf8_lossy(&line).trim_end()
+            ));
+        }
     }
 
     fn terminate(&mut self) -> Result<()> {
@@ -113,10 +148,20 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
                         self.init()?;
                         return self.wait_inner(reconnect);
                     }
+                    debug_log("等待超时（服务器未推送变化），退出 IDLE 重新确认状态");
                     Ok(WaitOutcome::TimedOut)
                 }
-                Ok(()) => Ok(WaitOutcome::MailboxChanged),
-                Err(r) => Err(r),
+                Ok(()) => {
+                    debug_log(&format!(
+                        "收到服务器推送，退出 IDLE：{}",
+                        String::from_utf8_lossy(&v).trim_end()
+                    ));
+                    Ok(WaitOutcome::MailboxChanged)
+                }
+                Err(r) => {
+                    debug_log(&format!("IDLE 等待出错：{r}"));
+                    Err(r)
+                }
             }?;
 
             // Handle Dovecot's imap_idle_notify_interval message
@@ -173,6 +218,27 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
         self.timed_wait(timeout, false)
     }
 
+    /// 带读超时的 DONE 收尾：退出 IDLE 并等服务器的 tagged 响应。
+    ///
+    /// 上游把这次收尾留给 `Drop`，而 `Drop` 路径的读**没有超时**——
+    /// 连接被对端静默丢弃（如网络断开）时会永久阻塞监听线程。
+    fn terminate_timed(&mut self, timeout: Duration) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        self.done = true;
+        let t0 = std::time::Instant::now();
+        self.session.write_line(b"DONE")?;
+        self.session.stream.get_mut().set_read_timeout(Some(timeout))?;
+        let res = self.session.read_response().map(|_| ());
+        let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
+        match &res {
+            Ok(()) => debug_log(&format!("DONE 收尾完成（{:?}）", t0.elapsed())),
+            Err(e) => debug_log(&format!("DONE 收尾失败（{:?}）：{e}", t0.elapsed())),
+        }
+        res
+    }
+
     fn timed_wait(mut self, timeout: Duration, reconnect: bool) -> Result<WaitOutcome> {
         self.session
             .stream
@@ -180,6 +246,8 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
             .set_read_timeout(Some(timeout))?;
         let res = self.wait_inner(reconnect);
         let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
+        // 收尾放在这里（而不是 Drop），保证 DONE 的响应读取有超时兜底。
+        self.terminate_timed(Duration::from_secs(10))?;
         res
     }
 }

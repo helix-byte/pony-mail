@@ -1496,6 +1496,17 @@ impl Store {
         self.set_setting("ai", &serde_json::to_string(s)?)
     }
 
+    pub fn mail_settings(&self) -> AppResult<MailSettings> {
+        let raw = self.get_setting("mail")?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<MailSettings>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_mail_settings(&self, s: &MailSettings) -> AppResult<()> {
+        self.set_setting("mail", &serde_json::to_string(s)?)
+    }
+
     // ------------------------------------------------------------------
     // 邮件路由
     // ------------------------------------------------------------------

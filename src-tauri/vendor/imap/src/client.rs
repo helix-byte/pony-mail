@@ -1447,7 +1447,7 @@ impl<T: Read + Write> Connection<T> {
             // Remove CRLF
             let len = into.len();
             let line = &into[(len - read)..(len - 2)];
-            eprint!("S: {}\n", String::from_utf8_lossy(line));
+            eprint!("S[{}]: {}\n", debug_stamp(), String::from_utf8_lossy(line));
         }
 
         Ok(read)
@@ -1463,10 +1463,18 @@ impl<T: Read + Write> Connection<T> {
         self.stream.write_all(&[CR, LF])?;
         self.stream.flush()?;
         if self.debug {
-            eprint!("C: {}\n", String::from_utf8(buf.to_vec()).unwrap());
+            eprint!("C[{}]: {}\n", debug_stamp(), String::from_utf8(buf.to_vec()).unwrap());
         }
         Ok(())
     }
+}
+
+/// 调试输出用的毫秒级时间戳。
+///
+/// 带时间戳的 S:/C: 协议日志能直接看出延迟发生在哪一环
+/// （服务器推送 → DONE 收尾 → SEARCH → FETCH），这是排查「新邮件到达慢」的关键依据。
+fn debug_stamp() -> impl std::fmt::Display {
+    chrono::Local::now().format("%H:%M:%S%.3f")
 }
 
 #[cfg(test)]

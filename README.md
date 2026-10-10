@@ -18,7 +18,7 @@
 | Gitee（国内推荐） | https://gitee.com/helix-byte/pony-mail/releases |
 | GitHub | https://github.com/helix-byte/pony-mail/releases |
 
-下载 `Pony-Mail_x.y.z_x64-setup.exe` 运行安装即可（Windows 10/11 自带 WebView2）。
+下载 `Pony.Mail_x.y.z_x64-setup.exe` 运行安装即可（Windows 10/11 自带 WebView2）。
 
 > 应用暂未购买代码签名证书，首次安装时 Windows SmartScreen 可能提示「未知发布者」，点「更多信息 → 仍要运行」即可。每个安装包在 Release 里都附带 `.sha256` 校验文件。
 

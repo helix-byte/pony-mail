@@ -99,6 +99,11 @@ export const api = {
     invoke<void>("classify_messages", { accountId, onEvent }),
   /** 请求中止正在进行的整理（在消息边界生效）。 */
   cancelClassify: (accountId: string) => invoke<void>("cancel_classify", { accountId }),
+  /**
+   * 为单封邮件执行 AI 打标签（右键菜单入口）。
+   * 不受「未整理队列」限制、不走快速通道；返回写回后的权威标签集合。
+   */
+  classifyMessage: (messageId: number) => invoke<number[]>("classify_message", { messageId }),
 };
 
 /** 统一把后端错误（字符串）转成可展示文案。 */

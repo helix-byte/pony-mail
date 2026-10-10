@@ -610,6 +610,9 @@ fn summary_cache_key(id: i64, message_id: &str, model: &str) -> String {
 const CLASSIFY_BATCH_LIMIT: i64 = 50;
 /// 连续失败熔断阈值：模型/解析连续失败这么多封即中止（写库失败不计入）。
 const MAX_CONSECUTIVE_FAILURES: usize = 3;
+/// 未配置任何 AI 整理维度时的提示（批量与单封两条路径共用）。
+const NO_GROUPS_HINT: &str =
+    "还没有开启 AI 整理的标签组。请先在左侧标签组的编辑里选择一种「AI 整理」模式。";
 
 /// 批量整理的事件流（Tauri Channel 点对点推送，前端逐封更新界面）。
 #[derive(Clone, Serialize)]
@@ -689,14 +692,8 @@ async fn run_classify(
     account_id: &str,
     on_event: &Channel<ClassifyEvent>,
 ) -> AppResult<()> {
-    // 维度组快照：此后用户改组只影响下一轮。
-    let groups = state.store.ai_dimension_groups(account_id)?;
-    if groups.is_empty() {
-        return Err(AppError::Other(
-            "还没有开启 AI 整理的标签组。请先在左侧标签组的编辑里选择一种「AI 整理」模式。"
-                .to_string(),
-        ));
-    }
+    // 维度组等快照：此后用户改组只影响下一轮。
+    let ctx = ClassifyCtx::load(state, account_id)?;
 
     // 取消标志（cancel_classify 置位；结束时由 classify_messages 统一清理）。
     let cancel = Arc::new(AtomicBool::new(false));
@@ -706,11 +703,8 @@ async fn run_classify(
         .expect("cancel_flags 锁中毒")
         .insert(account_id.to_string(), cancel.clone());
 
-    let settings = state.store.ai_settings()?;
-    // `now` 供模型判断时限；`stamp` 是写库用的时间戳。
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    // `stamp` 是写库用的时间戳（`now` 供模型判断时限，在 ctx 里）。
     let stamp = Utc::now().to_rfc3339();
-    let group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
 
     let ids = state.store.unclassified_ids(account_id, CLASSIFY_BATCH_LIMIT)?;
     let _ = on_event.send(ClassifyEvent::Start { total: ids.len() });
@@ -733,57 +727,9 @@ async fn run_classify(
             // 邮件在整理途中被删：跳过，不计数。
             Err(_) => continue,
         };
-        let sample_count = state
-            .store
-            .sender_classified_count(account_id, &input.from_addr, id)?;
-        let mut stats = Vec::with_capacity(groups.len());
-        for g in &groups {
-            stats.push(
-                state
-                    .store
-                    .sender_group_stats(account_id, &input.from_addr, id, g.id)?,
-            );
-        }
 
-        // ---- 推理阶段：快速通道优先，否则调模型 ----
-        // 快速通道：同发件人历史 ≥3 封且各启用组「唯一标签全覆盖或无历史」→ 跳过模型。
-        let consensus = classify::sender_consensus(&stats, sample_count, SENDER_SKIP_MIN_SAMPLES);
-        let via_fastlane = consensus.is_some();
-
-        let outcome: Result<Vec<GroupAssignment>, String> = match consensus {
-            Some(picks) => Ok(groups
-                .iter()
-                .zip(picks)
-                .map(|(g, p)| GroupAssignment {
-                    group_id: g.id,
-                    pick: p.map(Pick::Existing),
-                })
-                .collect()),
-            None => {
-                let hints = classify::sender_hints(&stats, &group_names, sample_count);
-                let system = classify::build_system_prompt(&groups);
-                let user = classify::build_user_prompt(&input, &hints, &now);
-                match ai::run_with_recovery(&state.http, &settings, |model| {
-                    ai::chat_json(&state.http, &settings, model, &system, &user, 512)
-                })
-                .await
-                {
-                    Ok(raw) => classify::parse_classify(&raw, &groups)
-                        .map(|parsed| {
-                            groups
-                                .iter()
-                                .zip(parsed.picks)
-                                .map(|(g, p)| GroupAssignment {
-                                    group_id: g.id,
-                                    pick: p,
-                                })
-                                .collect()
-                        })
-                        .ok_or_else(|| "模型输出无法解析为有效的整理结果".to_string()),
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-        };
+        // ---- 推理阶段（快速通道 / 模型，与单封打标共用）----
+        let outcome = compute_assignments(state, &ctx, id, &input, true).await;
 
         // ---- 写阶段 / 失败处理 ----
         match outcome {
@@ -805,7 +751,7 @@ async fn run_classify(
                     break;
                 }
             }
-            Ok(assignments) => {
+            Ok((assignments, via_fastlane)) => {
                 match state
                     .store
                     .save_classify_result(account_id, id, &assignments, &stamp)
@@ -848,6 +794,153 @@ async fn run_classify(
         cancelled,
     });
     Ok(())
+}
+
+/// 为**单封**邮件执行 AI 打标签（右键菜单「AI 自动标签」）。
+///
+/// 与批量整理共用推理与写回语义（手动标签保护、组内单选、写回事务全一致），
+/// 两处刻意差异：
+/// 1. 不受「未整理队列」限制——这是显式动作，已整理过的邮件也会重新判定
+///    （模型/prompt 更新后可用它逐封刷新）；
+/// 2. 不走发件人快速通道——手动单封就是要模型重新给判断，不被历史共识短路。
+#[tauri::command]
+pub async fn classify_message(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> AppResult<Vec<i64>> {
+    // 与批量整理共享账户级互斥：批处理进行中时单封动作直接拒绝。
+    let (account_id, _, _) = state.store.message_route(message_id)?;
+    {
+        let mut running = state.classifying.lock().expect("classifying 锁中毒");
+        if !running.insert(account_id.clone()) {
+            return Err(AppError::Other("该账户正在整理中，请稍候".to_string()));
+        }
+    }
+    let result = run_classify_single(&state, &account_id, message_id).await;
+    state
+        .classifying
+        .lock()
+        .expect("classifying 锁中毒")
+        .remove(&account_id);
+    result
+}
+
+async fn run_classify_single(
+    state: &AppState,
+    account_id: &str,
+    message_id: i64,
+) -> AppResult<Vec<i64>> {
+    let ctx = ClassifyCtx::load(state, account_id)?;
+    let stamp = Utc::now().to_rfc3339();
+    let input = state.store.classify_input(message_id)?;
+
+    let (assignments, _) = compute_assignments(state, &ctx, message_id, &input, false)
+        .await
+        .map_err(|message| AppError::Other(format!("AI 打标签失败：{message}")))?;
+
+    let tag_ids = state
+        .store
+        .save_classify_result(account_id, message_id, &assignments, &stamp)?;
+    Ok(tag_ids)
+}
+
+/// 单次整理运行的快照：维度组、模型设置与推理所需上下文。
+/// 运行中用户改组只影响下一轮（快照语义）。
+struct ClassifyCtx {
+    account_id: String,
+    groups: Vec<classify::DimensionGroup>,
+    group_names: Vec<String>,
+    settings: AiSettings,
+    /// 供模型判断时限的「当前时间」。
+    now: String,
+}
+
+impl ClassifyCtx {
+    /// 读取一次运行所需的全部快照；无启用维度组时报出可操作的中文提示。
+    fn load(state: &AppState, account_id: &str) -> AppResult<Self> {
+        let groups = state.store.ai_dimension_groups(account_id)?;
+        if groups.is_empty() {
+            return Err(AppError::Other(NO_GROUPS_HINT.to_string()));
+        }
+        let settings = state.store.ai_settings()?;
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let group_names = groups.iter().map(|g| g.name.clone()).collect();
+        Ok(Self {
+            account_id: account_id.to_string(),
+            groups,
+            group_names,
+            settings,
+            now,
+        })
+    }
+}
+
+/// 计算一封邮件的维度指派（推理阶段，不含写库）。
+///
+/// 返回 `Ok((assignments, via_fastlane))`；`Err(String)` 表示读数据/模型/解析失败，
+/// 由调用方决定如何计数（批量走连续失败与熔断，单封直接报错）。
+/// `allow_fastlane = false` 时强制走模型（见 `classify_message` 的说明）。
+async fn compute_assignments(
+    state: &AppState,
+    ctx: &ClassifyCtx,
+    message_id: i64,
+    input: &classify::ClassifyInput,
+    allow_fastlane: bool,
+) -> Result<(Vec<GroupAssignment>, bool), String> {
+    let groups = &ctx.groups;
+    let sample_count = state
+        .store
+        .sender_classified_count(&ctx.account_id, &input.from_addr, message_id)
+        .map_err(|e| e.to_string())?;
+    let mut stats = Vec::with_capacity(groups.len());
+    for g in groups {
+        stats.push(
+            state
+                .store
+                .sender_group_stats(&ctx.account_id, &input.from_addr, message_id, g.id)
+                .map_err(|e| e.to_string())?,
+        );
+    }
+
+    // 快速通道：同发件人历史 ≥3 封且各启用组「唯一标签全覆盖或无历史」→ 跳过模型。
+    if allow_fastlane {
+        if let Some(picks) =
+            classify::sender_consensus(&stats, sample_count, SENDER_SKIP_MIN_SAMPLES)
+        {
+            let assignments = groups
+                .iter()
+                .zip(picks)
+                .map(|(g, p)| GroupAssignment {
+                    group_id: g.id,
+                    pick: p.map(Pick::Existing),
+                })
+                .collect();
+            return Ok((assignments, true));
+        }
+    }
+
+    let hints = classify::sender_hints(&stats, &ctx.group_names, sample_count);
+    let system = classify::build_system_prompt(groups);
+    let user = classify::build_user_prompt(input, &hints, &ctx.now);
+    let raw = ai::run_with_recovery(&state.http, &ctx.settings, |model| {
+        ai::chat_json(&state.http, &ctx.settings, model, &system, &user, 512)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    classify::parse_classify(&raw, groups)
+        .map(|parsed| {
+            let assignments = groups
+                .iter()
+                .zip(parsed.picks)
+                .map(|(g, p)| GroupAssignment {
+                    group_id: g.id,
+                    pick: p,
+                })
+                .collect();
+            (assignments, false)
+        })
+        .ok_or_else(|| "模型输出无法解析为有效的整理结果".to_string())
 }
 
 // ---------------------------------------------------------------------

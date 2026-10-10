@@ -108,6 +108,13 @@ function onMenuToggleTag(tagId: number) {
   void store.toggleMessageTag(id, tagId);
 }
 
+/** 右键菜单「AI 自动标签」：为这封邮件单独跑一次智能整理。 */
+function onClassifyOne() {
+  const id = menu.messageId;
+  closeMenu();
+  if (id !== null) void store.classifyMessage(id);
+}
+
 // 滚动 / 缩放 / 按 Esc 都应关闭菜单，否则菜单会「漂」在错误位置。
 function onKeydown(e: KeyboardEvent) {
   if (e.key === "Escape") closeMenu();
@@ -431,6 +438,37 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="my-1 h-px bg-line" />
+
+        <!-- AI 自动标签：为这封邮件单独跑一次智能整理（批量进行中时禁用） -->
+        <button
+          class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] transition"
+          :class="
+            store.classifying || store.classifyOneBusy
+              ? 'cursor-not-allowed text-zinc-600'
+              : 'text-zinc-300 hover:bg-hover'
+          "
+          :disabled="store.classifying || store.classifyOneBusy"
+          @click="onClassifyOne"
+        >
+          <svg
+            class="h-3.5 w-3.5 shrink-0"
+            :class="store.classifying || store.classifyOneBusy ? 'text-zinc-700' : 'text-zinc-500'"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+          >
+            <path
+              d="M12 3l1.7 4.9 4.8 1.7-4.8 1.7L12 16.2l-1.7-4.9-4.8-1.7 4.8-1.7z"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"
+              stroke-linejoin="round"
+            />
+          </svg>
+          AI 自动标签
+        </button>
 
         <button
           class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-rose-400 transition hover:bg-rose-500/15"

@@ -84,6 +84,7 @@ pub fn run() {
             commands::get_cached_summary,
             commands::classify_messages,
             commands::cancel_classify,
+            commands::classify_message,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

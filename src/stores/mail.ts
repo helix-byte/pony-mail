@@ -52,6 +52,8 @@ export const useMailStore = defineStore("mail", () => {
   const aiSettings = ref<AiSettings | null>(null);
   /** 是否正在批量整理（账户级互斥，运行期间禁用入口）。 */
   const classifying = ref(false);
+  /** 单封「AI 自动标签」是否在途（防重复触发，右键菜单据此禁用）。 */
+  const classifyOneBusy = ref(false);
   /** 整理进度（逐封推进；null 表示未在整理）。 */
   const classifyProgress = ref<{ done: number; total: number } | null>(null);
   const autoClassify = computed(() => aiSettings.value?.autoClassify ?? true);
@@ -817,6 +819,36 @@ export const useMailStore = defineStore("mail", () => {
     }
   }
 
+  /**
+   * 为单封邮件执行 AI 打标签（右键菜单「AI 自动标签」）。
+   *
+   * 后端与批量整理共用同一条推理与写回链路；差异：不受「未整理队列」限制
+   * （显式动作，已整理过的邮件也会重新判定），且不走发件人快速通道。
+   */
+  async function classifyMessage(messageId: number) {
+    if (!activeAccountId.value || classifyOneBusy.value || classifying.value) return;
+    classifyOneBusy.value = true;
+    toast("正在用 AI 为这封邮件打标签…", "info");
+    try {
+      const tagIds = await api.classifyMessage(messageId);
+      setTagsLocally(messageId, tagIds);
+      await loadTags();
+      void loadGroups();
+      const names = tagIds
+        .map((id) => tags.value.find((t) => t.id === id)?.name)
+        .filter((n): n is string => Boolean(n));
+      if (names.length > 0) {
+        toast(`AI 已为该邮件打上：${names.join("、")}`, "ok");
+      } else {
+        toast("AI 判定无需打标签（该维度已有手动标签或没有匹配的标签）", "info");
+      }
+    } catch (e) {
+      toast(errorText(e), "error");
+    } finally {
+      classifyOneBusy.value = false;
+    }
+  }
+
   // ------------------------------------------------------------------
   // 写信
   // ------------------------------------------------------------------
@@ -905,11 +937,13 @@ export const useMailStore = defineStore("mail", () => {
     summaryError,
     aiSettings,
     classifying,
+    classifyOneBusy,
     classifyProgress,
     autoClassify,
     loadAiSettings,
     classifyAll,
     cancelClassify,
+    classifyMessage,
     setTagsLocally,
     tags,
     groups,

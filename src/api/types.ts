@@ -139,6 +139,8 @@ export interface AiSettings {
   model: string;
   /** 同步完成后自动整理新邮件（缺省视为开启）。 */
   autoClassify: boolean;
+  /** 打开邮件时自动生成摘要（缺省视为开启）。 */
+  autoSummarize: boolean;
 }
 
 /** 批量整理的事件流（与 Rust 侧 `ClassifyEvent` 的 serde 形态一一对应）。 */

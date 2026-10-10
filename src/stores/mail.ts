@@ -33,6 +33,15 @@ export interface ComposeDraft {
 
 let toastSeq = 0;
 
+/**
+ * 自动摘要触发前的静默期。
+ *
+ * 用户翻邮件比模型推理快得多：如果没有这段缓冲，快速点过 N 封就会让本地
+ * 模型为每封都排队完整跑一遍。静默期内切走即取消，只有真正停下来阅读的
+ * 邮件才会触发推理。
+ */
+const AUTO_SUMMARY_DELAY_MS = 500;
+
 export const useMailStore = defineStore("mail", () => {
   // ---- 数据 ----
   const accounts = ref<Account[]>([]);
@@ -46,6 +55,8 @@ export const useMailStore = defineStore("mail", () => {
   const summary = ref<Summary | null>(null);
   const summaryLoading = ref(false);
   const summaryError = ref("");
+  /** 自动摘要已排程、尚在静默期（见 scheduleAutoSummary），UI 据此提前进入「推理中」态。 */
+  const summaryPending = ref(false);
 
   // ---- 智能整理 ----
   /** AI 设置缓存（含「同步后自动整理」开关，缺省视为开启）。 */
@@ -57,6 +68,8 @@ export const useMailStore = defineStore("mail", () => {
   /** 整理进度（逐封推进；null 表示未在整理）。 */
   const classifyProgress = ref<{ done: number; total: number } | null>(null);
   const autoClassify = computed(() => aiSettings.value?.autoClassify ?? true);
+  /** 打开邮件时自动生成摘要（设置未加载时按默认开启处理）。 */
+  const autoSummarize = computed(() => aiSettings.value?.autoSummarize ?? true);
 
   // ---- 标签 ----
   const tags = ref<Tag[]>([]);
@@ -129,8 +142,7 @@ export const useMailStore = defineStore("mail", () => {
       if (!stillThere) {
         activeAccountId.value = "";
         messages.value = [];
-        detail.value = null;
-        activeMessageId.value = null;
+        resetReader();
         tags.value = [];
         groups.value = [];
         activeTagIds.value = [];
@@ -553,26 +565,72 @@ export const useMailStore = defineStore("mail", () => {
   // 阅读
   // ------------------------------------------------------------------
 
+  /**
+   * 阅读区请求序号：打开新邮件 / 清空阅读区时自增。
+   * 在途的正文拉取迟到回来时据此判断「已过时」并丢弃，防止写进后打开的邮件。
+   */
+  let readerSeq = 0;
+  /** 自动摘要排程定时器（静默期内未开跑，见 scheduleAutoSummary）。 */
+  let autoSummaryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** 撤销在途的自动摘要排程（切邮件 / 清空阅读区 / 手动触发时调用）。 */
+  function cancelAutoSummary() {
+    if (autoSummaryTimer !== null) {
+      clearTimeout(autoSummaryTimer);
+      autoSummaryTimer = null;
+    }
+    summaryPending.value = false;
+  }
+
+  /**
+   * 排程一次自动摘要：静默期结束后，若该邮件仍是当前打开的、且尚无摘要，
+   * 就自动开始生成。静默期内用户切走会被 cancelAutoSummary 取消。
+   */
+  function scheduleAutoSummary(id: number) {
+    cancelAutoSummary();
+    if (!autoSummarize.value) return;
+    summaryPending.value = true;
+    autoSummaryTimer = setTimeout(() => {
+      autoSummaryTimer = null;
+      summaryPending.value = false;
+      if (activeMessageId.value !== id || summary.value || summaryLoading.value) return;
+      void summarize(false, true);
+    }, AUTO_SUMMARY_DELAY_MS);
+  }
+
   function resetReader() {
+    // 自增序号让在途的正文拉取 / 自动摘要结果全部作废（见 openMessage）。
+    readerSeq += 1;
+    cancelAutoSummary();
     activeMessageId.value = null;
     detail.value = null;
     summary.value = null;
     summaryError.value = "";
+    summaryLoading.value = false;
+    // 若正有一封邮件在拉正文，阅读区已清空，不该继续显示「拉取中」。
+    busy.detail = false;
   }
 
   async function openMessage(id: number) {
     if (activeMessageId.value === id && detail.value) return;
+    const seq = ++readerSeq;
+    cancelAutoSummary();
     activeMessageId.value = id;
     detail.value = null;
     summary.value = null;
     summaryError.value = "";
+    // 上一封在途的摘要结果会被 summarize 的竞态保护丢弃，它的 loading 一并清掉。
+    summaryLoading.value = false;
     busy.detail = true;
     try {
       const d = await api.loadMessageBody(id);
-      detail.value = d;
       if (!d.header.seen) {
         await setSeen(id, true, false);
       }
+      // 竞态保护：首次拉正文要走 IMAP 可达数秒，期间用户可能已切到别的邮件，
+      // 迟到的正文不能盖到当前阅读区上（序号不符直接放弃，正文已落库不浪费）。
+      if (readerSeq !== seq) return;
+      detail.value = d;
       // 正文就绪后回填已有摘要缓存：有缓存就直接展示，
       // 不再让用户先看到「生成摘要」按钮再手动点一次。
       //
@@ -580,10 +638,15 @@ export const useMailStore = defineStore("mail", () => {
       // 但若不等它，`busy.detail` 会先落下、页面先渲染出「生成摘要」引导态，
       // 再被缓存内容替换——形成一次可见的闪动。等它一起渲染更干净。
       await loadCachedSummary(id);
+      // 缓存未命中且开了自动摘要 → 稍候自动生成，实现「点开即总结」。
+      if (readerSeq === seq && !summary.value) {
+        scheduleAutoSummary(id);
+      }
     } catch (e) {
-      toast(errorText(e), "error");
+      if (readerSeq === seq) toast(errorText(e), "error");
     } finally {
-      busy.detail = false;
+      // 只有仍是最新一次打开才复位，避免把后一封邮件的 loading 提前关掉。
+      if (readerSeq === seq) busy.detail = false;
     }
   }
 
@@ -704,17 +767,31 @@ export const useMailStore = defineStore("mail", () => {
   // AI 摘要
   // ------------------------------------------------------------------
 
-  async function summarize(force = false) {
+  /**
+   * 生成摘要。
+   *
+   * `auto` 为 true 表示由「打开邮件自动摘要」触发：失败时静默回落「生成摘要」
+   * 引导态，不展示错误——用户没主动要求，读邮件不该被报错打断；
+   * 想手动重试时自会看到具体原因。
+   */
+  async function summarize(force = false, auto = false) {
     const id = activeMessageId.value;
     if (!id) return;
+    // 手动触发先撤销自动排程，避免同一次点击跑两遍推理。
+    if (!auto) cancelAutoSummary();
     summaryLoading.value = true;
     summaryError.value = "";
     try {
-      summary.value = await api.summarizeMessage(id, force);
+      const s = await api.summarizeMessage(id, force);
+      // 竞态保护：等待期间用户可能已切到别的邮件，迟到的摘要不能写进当前阅读区。
+      if (activeMessageId.value !== id) return;
+      summary.value = s;
     } catch (e) {
-      summaryError.value = errorText(e);
+      if (activeMessageId.value !== id) return;
+      if (!auto) summaryError.value = errorText(e);
     } finally {
-      summaryLoading.value = false;
+      // 只复位自己这封邮件的 loading，避免误关后一封邮件正在跑的推理状态。
+      if (activeMessageId.value === id) summaryLoading.value = false;
     }
   }
 
@@ -935,6 +1012,7 @@ export const useMailStore = defineStore("mail", () => {
     summary,
     summaryLoading,
     summaryError,
+    summaryPending,
     aiSettings,
     classifying,
     classifyOneBusy,

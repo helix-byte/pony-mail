@@ -179,6 +179,9 @@ pub struct AiSettings {
     /// 同步完成后自动整理新邮件。缺省视为开启（存量 settings JSON 无此键时由 serde 默认补上）。
     #[serde(default = "default_true")]
     pub auto_classify: bool,
+    /// 打开邮件时自动生成摘要（缺省视为开启，兼容存量 settings JSON）。
+    #[serde(default = "default_true")]
+    pub auto_summarize: bool,
 }
 
 impl Default for AiSettings {
@@ -189,6 +192,7 @@ impl Default for AiSettings {
             // 若本机未安装，生成摘要时会自动回退到第一个可用模型。
             model: "qwen3.5:9b".to_string(),
             auto_classify: true,
+            auto_summarize: true,
         }
     }
 }
@@ -223,4 +227,35 @@ pub struct ParsedMail {
     pub body_html: String,
     pub attachments: Vec<AttachmentMeta>,
     pub has_body: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_settings_default_enables_both_auto_switches() {
+        let s = AiSettings::default();
+        assert!(s.auto_classify);
+        assert!(s.auto_summarize);
+    }
+
+    #[test]
+    fn ai_settings_legacy_json_without_auto_summarize_defaults_to_true() {
+        // 存量 settings JSON 没有 autoSummarize 键，反序列化必须补默认开启，
+        // 否则老用户升级后自动摘要会被静默关掉。
+        let raw = r#"{"baseUrl":"http://localhost:11434","model":"m","autoClassify":false}"#;
+        let s: AiSettings = serde_json::from_str(raw).expect("存量 JSON 应可反序列化");
+        assert!(!s.auto_classify);
+        assert!(s.auto_summarize, "缺省键应默认开启自动摘要");
+    }
+
+    #[test]
+    fn ai_settings_explicit_auto_summarize_false_roundtrips() {
+        let raw = r#"{"baseUrl":"u","model":"m","autoClassify":true,"autoSummarize":false}"#;
+        let s: AiSettings = serde_json::from_str(raw).unwrap();
+        assert!(!s.auto_summarize, "显式关闭必须被尊重");
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"autoSummarize\":false"));
+    }
 }

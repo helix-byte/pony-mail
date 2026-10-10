@@ -1,19 +1,25 @@
 //! 实时收信：为每个账号常驻一个 IMAP 监听线程。
 //!
 //! 策略：登录后进入 IDLE（RFC 2177），服务器有新变化（典型是新邮件到达）立刻唤醒；
-//! 不支持 IDLE 的服务器退化为 [`POLL_INTERVAL`] 定时轮询，效果接近但有延迟上限。
+//! 不支持 IDLE 的服务器（如网易 163）退化为 [`POLL_INTERVAL`] 定时轮询，
+//! 效果接近但有延迟上限。
 //! 发现新邮件立即落库，并向前端推送 [`EVENT_NEW_MAIL`] 事件、按设置弹系统通知。
 //!
 //! 线程生命周期与账号绑定：`start` 幂等（重复调用会替换旧线程），
 //! `stop` 置位停止标志，线程在下一个检查点退出。断线自动退避重连，
 //! 账号被删除时线程自行结束。
+//!
+//! 诊断：线程会把时间线（连接、取信、通知、重连）追加写入应用数据目录的
+//! `pony-watch.log`，排查「新邮件到达慢」先看它。
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use chrono::Utc;
+use imap::extensions::idle::WaitOutcome;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -35,16 +41,26 @@ pub const EVENT_WATCH_STATE: &str = "mail:watch-state";
 
 /// IDLE 单次等待时长。超时不是错误——只是退出 IDLE 重新确认一次状态，
 /// 顺便给停止标志一个生效机会；真实新邮件由服务器推送唤醒，不受此值影响。
-const IDLE_WAIT: Duration = Duration::from_secs(60);
-/// 不支持 IDLE 的服务器（能力探测未命中）的轮询间隔。
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// 同时它也是「服务器推送丢失/延迟」时的兜底轮询间隔，不宜过长。
+const IDLE_WAIT: Duration = Duration::from_secs(30);
+/// 不支持 IDLE 的服务器（能力探测未命中；网易 163 实测直接拒绝 IDLE 命令）的轮询间隔。
+///
+/// 这是这类账号实时性的直接上限：显示延迟 ≈ 服务器把邮件放进收件箱的固有延迟
+/// （163 实测 SMTP 发出后约 7.5 秒才在 IMAP 可见）+ 轮询相位（0 到该值之间）。
+/// 取 15 秒是「足够快」与「不给服务器压力、避免触发风控」之间的折中；
+/// 若服务器开始报错或限流，优先调大此值。
+const POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// 单轮最多拉取的新邮件数。积压超过此数时只拉最新一批（更早的积压不再补齐，
 /// 与手动同步的 limit 语义一致），把单次同步的开销限制在可控范围内。
 const FETCH_LIMIT: usize = 50;
 /// 首次接入（本地毫无缓存）时的静默补齐数量，与手动同步的默认值一致。
 const INITIAL_FETCH_LIMIT: usize = 40;
-/// 断线重连的退避区间。
+/// 首次连接就失败（登录失败 / 网络不可达）时的重试起点。
+/// 起值放长是对账号的保护：密码错误等场景下不至于高频冲击登录接口。
 const BACKOFF_MIN: Duration = Duration::from_secs(10);
+/// 连接曾经建立、随后中断（唤醒处理出错 / 网络抖动）时的重试起点。
+/// 这类故障多为瞬时，取更短的值让实时性尽快恢复。
+const BACKOFF_AFTER_DROP: Duration = Duration::from_secs(3);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// 事件中携带的新邮件摘要条数上限（通知展示用，不全量传）。
 const EVENT_MAIL_SAMPLE: usize = 3;
@@ -187,6 +203,7 @@ fn run(app: AppHandle, account_id: String, stop: Arc<AtomicBool>) {
         state.store.clone()
     };
     let mut backoff = BACKOFF_MIN;
+    watch_log(&app, &format!("监听线程启动（账号 {account_id}）"));
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -199,6 +216,7 @@ fn run(app: AppHandle, account_id: String, stop: Arc<AtomicBool>) {
         let password = match credentials::get_password(&account_id) {
             Ok(p) => p,
             Err(e) => {
+                watch_log(&app, &format!("读取密码失败：{e}；{backoff:?} 后重试"));
                 set_state(&app, &account_id, "reconnecting", &format!("读取密码失败：{e}"));
                 if sleep_or_stop(&stop, backoff) {
                     return;
@@ -217,6 +235,7 @@ fn run(app: AppHandle, account_id: String, stop: Arc<AtomicBool>) {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
+                watch_log(&app, &format!("监听中断：{e}；{backoff:?} 后重连"));
                 set_state(&app, &account_id, "reconnecting", &e.to_string());
                 if sleep_or_stop(&stop, backoff) {
                     return;
@@ -246,9 +265,7 @@ fn watch_once(
         .capabilities()
         .map(|caps| caps.has_str("IDLE"))
         .unwrap_or(false);
-
-    // 连上了：退避清零，并向后端/前端宣告在线。
-    *backoff = BACKOFF_MIN;
+    watch_log(app, &format!("已连接（IDLE={idle_supported}）"));
     set_state(app, &account.id, "online", "");
 
     // 首次接入（本地没有任何缓存）做一次静默补齐：只拉最近一批，不当「新邮件」
@@ -256,7 +273,15 @@ fn watch_once(
     let initial =
         store.last_uid(&account.id, FOLDER)? == 0 && store.count_messages(&account.id, FOLDER)? == 0;
     let limit = if initial { INITIAL_FETCH_LIMIT } else { FETCH_LIMIT };
+    let t0 = std::time::Instant::now();
     let fresh = poll_new(store, &mut session, &account.id, limit)?;
+    watch_log(
+        app,
+        &format!("首轮检查完成（{:?}）：{} 封新邮件", t0.elapsed(), fresh.len()),
+    );
+    // 首轮取信成功才算「健康连接」：退避回到短档。若失败发生在更早的建立阶段
+    // （反复登录失败等），退避继续按首次连接的长档增长，避免高频冲击登录接口。
+    *backoff = BACKOFF_AFTER_DROP;
     if !initial && !fresh.is_empty() {
         deliver(app, store, account, fresh);
     }
@@ -268,8 +293,26 @@ fn watch_once(
         if idle_supported {
             // 进入 IDLE 等待服务器推送变化；超时或收到变化都会返回。
             // Handle 在 wait_with_timeout 内部完成 DONE 收尾，随后可继续用本会话。
-            let handle = session.idle()?;
-            handle.wait_with_timeout(IDLE_WAIT)?;
+            match session.idle() {
+                Ok(handle) => {
+                    let t = std::time::Instant::now();
+                    let outcome = handle.wait_with_timeout(IDLE_WAIT)?;
+                    if outcome == WaitOutcome::MailboxChanged {
+                        watch_log(
+                            app,
+                            &format!("IDLE 被服务器推送唤醒（等待 {:.1}s）", t.elapsed().as_secs_f32()),
+                        );
+                    }
+                }
+                Err(e) => {
+                    // 能力探测与真实行为不符（如服务器拒绝 IDLE）：本会话退回轮询，
+                    // 而不是让整条连接作废——连接若其实已坏，下一轮检查自会报错重连。
+                    watch_log(app, &format!("进入 IDLE 失败，本会话退回轮询：{e}"));
+                    if sleep_or_stop(stop, POLL_INTERVAL) {
+                        break;
+                    }
+                }
+            }
         } else if sleep_or_stop(stop, POLL_INTERVAL) {
             break;
         }
@@ -277,8 +320,17 @@ fn watch_once(
             break;
         }
 
+        let t0 = std::time::Instant::now();
         let fresh = poll_new(store, &mut session, &account.id, FETCH_LIMIT)?;
         if !fresh.is_empty() {
+            watch_log(
+                app,
+                &format!(
+                    "检查到 {} 封新邮件（SEARCH+FETCH 用时 {:?}）",
+                    fresh.len(),
+                    t0.elapsed()
+                ),
+            );
             deliver(app, store, account, fresh);
         }
     }
@@ -317,7 +369,12 @@ fn poll_new(
 
     store.upsert_folder(account_id, FOLDER)?;
     store.upsert_headers(account_id, FOLDER, &mails, &now)?;
-    if let Some(&max) = uids.last() {
+    // 游标只推进到「实际解析成功」的最大 UID，而不是请求的最大 UID：
+    // 某些服务器对新到邮件存在短暂不可取（SEARCH 已可见、FETCH 暂拿不到
+    // header）。若按请求推进，这封邮件会被游标永久跳过；不推进则下一轮
+    // 自动重试直到取到（若邮件已不存在，RFC 3501 的 `n:*` 包含最后一封的
+    // 特性由上方 `uid > since` 过滤兜底，不会造成空转取信）。
+    if let Some(max) = mails.iter().map(|m| m.uid).max() {
         store.set_last_uid(account_id, FOLDER, max, &now)?;
     }
     // 同步文件夹计数（失败不影响主流程，与手动同步的处理一致）。
@@ -360,6 +417,22 @@ fn deliver(app: &AppHandle, store: &Store, account: &Account, fresh: Vec<ParsedM
             messages,
         },
     );
+    let newest_desc = fresh
+        .iter()
+        .max_by_key(|m| m.uid)
+        .map(|m| {
+            let s = m.subject.trim();
+            if s.is_empty() {
+                "（无主题）".to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .unwrap_or_default();
+    watch_log(
+        app,
+        &format!("新邮件事件已推送：{} 封（最新：{newest_desc}）", fresh.len()),
+    );
 
     // 系统通知开关即时生效：每次新邮件都重新读设置。
     let enabled = store
@@ -367,6 +440,7 @@ fn deliver(app: &AppHandle, store: &Store, account: &Account, fresh: Vec<ParsedM
         .map(|s| s.notify_new_mail)
         .unwrap_or(true);
     if !enabled {
+        watch_log(app, "系统通知已按设置关闭，仅应用内提示");
         return;
     }
     let Some(newest) = fresh.iter().max_by_key(|m| m.uid) else {
@@ -374,7 +448,10 @@ fn deliver(app: &AppHandle, store: &Store, account: &Account, fresh: Vec<ParsedM
     };
     let (title, body) = notification_text(&account.email, newest, fresh.len());
     // 通知失败（如系统未允许）不视为错误：应用内提示仍然可见。
-    let _ = app.notification().builder().title(title).body(body).show();
+    match app.notification().builder().title(title).body(body).show() {
+        Ok(()) => watch_log(app, "系统通知已弹出"),
+        Err(e) => watch_log(app, &format!("系统通知弹出失败：{e}")),
+    }
 }
 
 /// 组装系统通知文案（纯函数，便于单测）。
@@ -416,6 +493,40 @@ fn sleep_or_stop(stop: &AtomicBool, total: Duration) -> bool {
 
 fn grow(backoff: Duration) -> Duration {
     (backoff * 2).min(BACKOFF_MAX)
+}
+
+/// 监听线程的常驻日志：追加写入应用数据目录的 `pony-watch.log`（与 pony.db 同目录，
+/// 即 `%APPDATA%\com.skyline.ponymail\`）。文件超过 2MB 时在进程首次写入时清卷重建。
+///
+/// 排查「新邮件到达慢」这类问题的核心时间线就在这里——连接建立/中断、取信、
+/// 通知与重连退避，全部带毫秒时间戳。开 `PONY_IMAP_DEBUG` 时同一内容也输出到
+/// stderr，并同时开启 vendored imap 的逐行协议日志（S:/C:，同样带时间戳），
+/// 便于把延迟精确归因到某个协议环节。
+fn watch_log(app: &AppHandle, msg: &str) {
+    let stamp = chrono::Local::now().format("%m-%d %H:%M:%S%.3f");
+    if std::env::var_os("PONY_IMAP_DEBUG").is_some() {
+        eprintln!("[watch {stamp}] {msg}");
+    }
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let path = dir.join("pony-watch.log");
+    // 体积检查每个进程只做一次，避免每次写日志都 stat。
+    static SIZE_CHECKED: AtomicBool = AtomicBool::new(false);
+    if !SIZE_CHECKED.swap(true, Ordering::Relaxed) {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > 2 * 1024 * 1024 {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[watch {stamp}] {msg}");
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { getVersion } from "@tauri-apps/api/app";
 import { onMounted, ref } from "vue";
 
 import { api, errorText } from "../api";
@@ -14,6 +15,14 @@ const autoClassify = ref(true);
 const autoSummarize = ref(true);
 /** 新邮件到达时弹系统通知（缺省开启）。 */
 const notifyNewMail = ref(true);
+/** 当前版本号（启动时读取，失败留空）。 */
+const version = ref("");
+/** 启动后自动检查更新（缺省开启）。 */
+const autoCheck = ref(true);
+/** 已跳过的版本：仅原样回写，避免保存时丢失。 */
+const skippedVersion = ref("");
+const checkingUpdate = ref(false);
+const updateMessage = ref("");
 const models = ref<string[]>([]);
 const online = ref(false);
 const message = ref("");
@@ -33,6 +42,18 @@ onMounted(async () => {
   try {
     const m = await api.getMailSettings();
     notifyNewMail.value = m.notifyNewMail;
+  } catch (e) {
+    store.toast(errorText(e), "error");
+  }
+  try {
+    version.value = await getVersion();
+  } catch {
+    // 版本号读取失败不影响设置页其它功能，留空即可。
+  }
+  try {
+    const u = await api.getUpdateSettings();
+    autoCheck.value = u.autoCheck;
+    skippedVersion.value = u.skippedVersion;
   } catch (e) {
     store.toast(errorText(e), "error");
   }
@@ -57,6 +78,24 @@ async function check() {
   }
 }
 
+/** 手动检查更新；发现新版本时直接弹出更新对话框。 */
+async function checkUpdateNow() {
+  checkingUpdate.value = true;
+  updateMessage.value = "";
+  try {
+    const info = await store.checkUpdate();
+    if (!info) return;
+    if (info.hasUpdate) {
+      updateMessage.value = `发现新版本 v${info.latest}`;
+      store.ui.updateOpen = true;
+    } else {
+      updateMessage.value = `已是最新版本（v${info.current}）`;
+    }
+  } finally {
+    checkingUpdate.value = false;
+  }
+}
+
 async function save() {
   saving.value = true;
   try {
@@ -67,6 +106,12 @@ async function save() {
       autoClassify: autoClassify.value,
       autoSummarize: autoSummarize.value,
     });
+    await api.setUpdateSettings({
+      autoCheck: autoCheck.value,
+      skippedVersion: skippedVersion.value,
+    });
+    // 刷新 store 缓存：避免「跳过此版本」基于过期设置回写。
+    void store.loadUpdateSettings();
     // 刷新 store 缓存：自动整理开关立即生效（sync 完成后读取的正是它）。
     void store.loadAiSettings();
     store.toast("设置已保存", "ok");
@@ -201,6 +246,43 @@ async function save() {
             下载。
           </p>
         </div>
+
+        <div class="flex items-center gap-3 pt-1">
+          <span class="text-[11px] font-medium tracking-wide text-zinc-500">关于与更新</span>
+          <span class="h-px flex-1 bg-line" />
+        </div>
+
+        <div class="rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <div class="flex items-center gap-2">
+            <span class="text-[12.5px] text-zinc-300">
+              Pony Mail{{ version ? ` v${version}` : "" }}
+            </span>
+            <button
+              class="ml-auto rounded-lg border border-line px-3 py-1.5 text-[12px] text-zinc-300 transition hover:border-accent/50 hover:text-indigo-300 disabled:opacity-50"
+              :disabled="checkingUpdate"
+              @click="checkUpdateNow"
+            >
+              {{ checkingUpdate ? "检查中…" : "检查更新" }}
+            </button>
+          </div>
+          <p v-if="updateMessage" class="mt-2.5 text-[11.5px] leading-relaxed text-zinc-500">
+            {{ updateMessage }}
+          </p>
+          <p v-if="skippedVersion" class="mt-2.5 text-[11.5px] leading-relaxed text-zinc-500">
+            已跳过 v{{ skippedVersion }} 的自动提示，可在上方手动检查。
+          </p>
+        </div>
+
+        <label class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <input v-model="autoCheck" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500" />
+          <span class="min-w-0">
+            <span class="block text-[12.5px] text-zinc-300">启动后自动检查更新</span>
+            <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
+              启动约 10 秒后后台检查 Gitee / GitHub 的最新版本，发现新版本时弹窗提示；
+              只检查和提醒，不会自动下载或安装。
+            </span>
+          </span>
+        </label>
       </div>
 
       <div class="flex shrink-0 items-center gap-3 border-t border-line px-5 py-3.5">

@@ -49,6 +49,8 @@ reqwest = { version = "0.13", features = ["json"] }
 
 # ---- 通用工具 ----
 regex = "1"
+# 更新检查：比较 Release tag 与当前版本的 semver。
+semver = "1"
 chrono = { version = "0.4", features = ["serde"] }
 # 说明：tauri-build → schemars 0.8 依赖 indexmap 1.x，而 indexmap 1.9 用
 # `#[cfg(has_std)]` 决定 IndexMap 是否有默认类型参数。这里显式启用 std feature，

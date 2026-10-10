@@ -8,6 +8,7 @@ import MessageList from "./components/MessageList.vue";
 import MessageReader from "./components/MessageReader.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import ToastBar from "./components/ToastBar.vue";
+import UpdateDialog from "./components/UpdateDialog.vue";
 import { useMailStore } from "./stores/mail";
 
 const store = useMailStore();
@@ -18,6 +19,8 @@ onMounted(() => {
   void store.loadAiSettings();
   // 实时收信：接入新邮件与监听状态事件（此后常驻，无需重复调用）。
   void store.initRealtime();
+  // 更新检查：接入「发现新版本」事件（自动检查在 Rust 侧启动后延迟触发）。
+  void store.initUpdater();
 });
 </script>
 
@@ -31,5 +34,6 @@ onMounted(() => {
   <ComposeDialog v-if="store.ui.composeOpen" />
   <AccountDialog v-if="store.ui.accountOpen" />
   <SettingsDialog v-if="store.ui.settingsOpen" />
+  <UpdateDialog v-if="store.ui.updateOpen" />
   <ToastBar />
 </template>

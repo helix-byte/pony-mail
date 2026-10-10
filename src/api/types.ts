@@ -149,6 +149,32 @@ export interface MailSettings {
   notifyNewMail: boolean;
 }
 
+/** 更新检查结果（`check_update` 命令与 `update:available` 事件共用）。 */
+export interface UpdateInfo {
+  /** 当前运行的版本。 */
+  current: string;
+  /** 两平台比较后较新的版本（无更新时即当前版本）。 */
+  latest: string;
+  hasUpdate: boolean;
+  /** 较新版本的来源平台："gitee" / "github"（无更新时为空串）。 */
+  source: string;
+  /** 两平台的 Release 页面链接（可能为 null）。 */
+  giteeUrl: string | null;
+  githubUrl: string | null;
+  /** Release 说明正文（可能为空）。 */
+  notes: string;
+  /** 检查时间（本地时间字符串）。 */
+  checkedAt: string;
+}
+
+/** 更新偏好设置。 */
+export interface UpdateSettings {
+  /** 启动后自动检查更新（缺省视为开启）。 */
+  autoCheck: boolean;
+  /** 已跳过的版本号：自动检查不再提示它；手动检查仍会显示。空串 = 未跳过。 */
+  skippedVersion: string;
+}
+
 /** 新邮件事件（`mail:new`）携带的单封摘要。 */
 export interface NewMailItem {
   subject: string;

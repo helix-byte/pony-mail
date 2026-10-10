@@ -16,6 +16,8 @@ import type {
   Tag,
   TagGroup,
   TestReport,
+  UpdateInfo,
+  UpdateSettings,
   WatchStateEvent,
 } from "./types";
 
@@ -112,6 +114,13 @@ export const api = {
    * 不受「未整理队列」限制、不走快速通道；返回写回后的权威标签集合。
    */
   classifyMessage: (messageId: number) => invoke<number[]>("classify_message", { messageId }),
+
+  // ---- 更新 ----
+  /** 检查更新（查询 Gitee / GitHub 最新 Release）。force=true 时忽略「跳过此版本」。 */
+  checkUpdate: (force = false) => invoke<UpdateInfo>("check_update", { force }),
+  getUpdateSettings: () => invoke<UpdateSettings>("get_update_settings"),
+  setUpdateSettings: (settings: UpdateSettings) =>
+    invoke<void>("set_update_settings", { settings }),
 };
 
 /** 统一把后端错误（字符串）转成可展示文案。 */

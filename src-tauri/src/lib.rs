@@ -12,6 +12,10 @@ pub mod classify;
 mod commands;
 mod credentials;
 mod error;
+/// 通用文件日志（收信监听与更新检查共用 `pony-watch.log`）。
+mod log;
+/// 检查更新（并发查询 Gitee / GitHub 的 releases/latest）。
+mod update;
 /// 实时收信监听（IDLE / 轮询 + 新邮件事件与系统通知）。
 /// 公开是因为 AppState 的 pub 字段引用了其事件类型。
 pub mod watcher;
@@ -20,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use store::Store;
 
@@ -62,6 +66,44 @@ pub fn run() {
             });
             // 为已登记的每个账号拉起实时收信监听（新账号在 add_account 里即时启动）。
             watcher::start_all(app.handle());
+
+            // 启动后延迟自动检查更新：避开启动高峰（IMAP 监听/同步相继起步）；
+            // 仅正式构建触发；发现新版本且未被跳过时推送 update:available 事件。
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if cfg!(debug_assertions) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let state = handle.state::<AppState>();
+                let settings = match state.store.update_settings() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::log_line(&handle, "update", &format!("读取更新设置失败：{e}"));
+                        return;
+                    }
+                };
+                if !settings.auto_check {
+                    return;
+                }
+                let current = handle.package_info().version.to_string();
+                match update::check(&handle, &state.http, &current).await {
+                    Ok(mut info) => {
+                        info.apply_skip(&settings.skipped_version, false);
+                        if info.has_update {
+                            log::log_line(
+                                &handle,
+                                "update",
+                                &format!("发现新版本 v{}（来源 {}）", info.latest, info.source),
+                            );
+                            let _ = handle.emit(update::EVENT_UPDATE_AVAILABLE, &info);
+                        } else {
+                            log::log_line(&handle, "update", "自动检查：已是最新版本");
+                        }
+                    }
+                    Err(e) => log::log_line(&handle, "update", &format!("自动检查失败：{e}")),
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -100,6 +142,9 @@ pub fn run() {
             commands::classify_messages,
             commands::cancel_classify,
             commands::classify_message,
+            commands::get_update_settings,
+            commands::set_update_settings,
+            commands::check_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

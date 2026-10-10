@@ -6,6 +6,8 @@
 
 - **多账号 IMAP 收信**：支持网易 163/126 等国内邮箱与通用 IMAP 服务器；账号密码保存在 Windows 凭据管理器。
 - **实时收信**：常驻 IMAP 监听（服务器支持时走 IDLE 推送，否则自动轮询兜底），新邮件无需手动同步，并弹出系统通知。
+- **系统托盘**：点关闭按钮默认最小化到托盘（可在设置中改为直接退出），后台持续收信；托盘图标在未读时显示红点、
+  悬停提示未读数量，左键唤出 / 收起窗口，右键菜单可退出；另支持开机自启与单实例保护（重复启动唤醒已有窗口）。
 - **本地 AI（可选）**：接入本地 Ollama（或 OpenAI 兼容接口），同步完成后自动整理邮件打标签；打开邮件自动生成摘要，命中缓存不重复推理。
 - **标签与标签组**：自定义颜色、分组管理，支持按组筛选；标签组可选择交给 AI 自动整理。
 - **撰写与发送**：SMTP 发送、回复 / 转发，正文渲染做了 sanitize 处理。
@@ -33,6 +35,7 @@ npm run tauri build      # 打包 NSIS 安装包，产物在 src-tauri/target/re
 ```
 
 应用图标源文件在 `assets/app-icon.svg`（手写矢量图）；修改后运行 `npm run tauri icon assets/app-icon.svg` 重新生成 `src-tauri/icons/` 全套图标。
+托盘「未读」版本图标（`src-tauri/icons/tray-unread.png`）由 `cargo run --example gen_tray_unread`（在 `src-tauri/` 目录下运行）从 `icons/32x32.png` 合成，修改主图标后需重新生成一次。
 
 国内网络下首次打包若卡在下载 NSIS 工具链，可设置 GitHub 镜像后重试：
 

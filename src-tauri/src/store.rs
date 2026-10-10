@@ -1518,6 +1518,39 @@ impl Store {
         self.set_setting("update", &serde_json::to_string(s)?)
     }
 
+    pub fn tray_settings(&self) -> AppResult<TraySettings> {
+        let raw = self.get_setting("tray")?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<TraySettings>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn save_tray_settings(&self, s: &TraySettings) -> AppResult<()> {
+        self.set_setting("tray", &serde_json::to_string(s)?)
+    }
+
+    /// 「首次隐藏到托盘」的系统提示是否已发过。用独立键而非放进 `TraySettings`：
+    /// 前端保存设置时整结构回写 tray 键，标记放进去会被旧值覆盖。
+    /// 读取失败视为已发（宁可漏提示，不要每次隐藏都打扰）。
+    pub fn tray_hide_notified(&self) -> AppResult<bool> {
+        Ok(self.get_setting("tray_hide_notified")?.as_deref() == Some("1"))
+    }
+
+    pub fn set_tray_hide_notified(&self) -> AppResult<()> {
+        self.set_setting("tray_hide_notified", "1")
+    }
+
+    /// 全部账号收件箱的未读总数（托盘 tooltip 与未读红点据此刷新）。
+    /// 口径与列表一致：只计 INBOX（当前产品只同步收件箱）。
+    pub fn unread_total(&self) -> AppResult<i64> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE seen = 0 AND folder = 'INBOX'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     // ------------------------------------------------------------------
     // 邮件路由
     // ------------------------------------------------------------------

@@ -237,6 +237,22 @@ impl Default for UpdateSettings {
     }
 }
 
+/// 托盘行为设置。与 AI / 邮件 / 更新设置分开存储（独立 settings 键 "tray"）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraySettings {
+    /// 点窗口关闭按钮时隐藏到系统托盘而非退出。缺省开启——存量 settings JSON
+    /// 无此键时由 serde 默认补上，保证老用户升级后关闭行为与新产品预期一致。
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+}
+
+impl Default for TraySettings {
+    fn default() -> Self {
+        Self { close_to_tray: true }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendPayload {
@@ -345,5 +361,27 @@ mod tests {
         assert_eq!(s.skipped_version, "0.2.0");
         let out = serde_json::to_string(&s).unwrap();
         assert!(out.contains("\"skippedVersion\":\"0.2.0\""));
+    }
+
+    #[test]
+    fn tray_settings_default_closes_to_tray() {
+        assert!(TraySettings::default().close_to_tray);
+    }
+
+    #[test]
+    fn tray_settings_legacy_json_defaults_close_to_tray_true() {
+        // 存量 settings JSON 没有 closeToTray 键，反序列化必须补默认开启，
+        // 否则老用户升级后点关闭按钮会直接退出，与产品预期的托盘常驻不符。
+        let s: TraySettings = serde_json::from_str("{}").expect("空 JSON 应可反序列化");
+        assert!(s.close_to_tray, "缺省键应默认关闭到托盘");
+    }
+
+    #[test]
+    fn tray_settings_explicit_false_roundtrips() {
+        let raw = r#"{"closeToTray":false}"#;
+        let s: TraySettings = serde_json::from_str(raw).unwrap();
+        assert!(!s.close_to_tray, "显式关闭必须被尊重");
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"closeToTray\":false"));
     }
 }

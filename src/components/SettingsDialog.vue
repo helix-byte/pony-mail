@@ -12,6 +12,8 @@ const model = ref("qwen3.5:9b");
 const autoClassify = ref(true);
 /** 打开邮件时自动生成摘要（缺省开启）。 */
 const autoSummarize = ref(true);
+/** 新邮件到达时弹系统通知（缺省开启）。 */
+const notifyNewMail = ref(true);
 const models = ref<string[]>([]);
 const online = ref(false);
 const message = ref("");
@@ -25,6 +27,12 @@ onMounted(async () => {
     model.value = s.model;
     autoClassify.value = s.autoClassify;
     autoSummarize.value = s.autoSummarize;
+  } catch (e) {
+    store.toast(errorText(e), "error");
+  }
+  try {
+    const m = await api.getMailSettings();
+    notifyNewMail.value = m.notifyNewMail;
   } catch (e) {
     store.toast(errorText(e), "error");
   }
@@ -52,6 +60,7 @@ async function check() {
 async function save() {
   saving.value = true;
   try {
+    await api.setMailSettings({ notifyNewMail: notifyNewMail.value });
     await api.setAiSettings({
       baseUrl: baseUrl.value.trim(),
       model: model.value.trim(),
@@ -60,7 +69,7 @@ async function save() {
     });
     // 刷新 store 缓存：自动整理开关立即生效（sync 完成后读取的正是它）。
     void store.loadAiSettings();
-    store.toast("AI 设置已保存", "ok");
+    store.toast("设置已保存", "ok");
     store.ui.settingsOpen = false;
   } catch (e) {
     store.toast(errorText(e), "error");
@@ -74,8 +83,8 @@ async function save() {
   <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm">
     <div class="flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-line bg-panel shadow-2xl">
       <div class="flex shrink-0 items-center border-b border-line px-5 py-3.5">
-        <h2 class="text-[14px] font-semibold text-zinc-100">AI 设置</h2>
-        <span class="ml-3 text-[11.5px] text-zinc-500">本地 Ollama · 数据不出本机</span>
+        <h2 class="text-[14px] font-semibold text-zinc-100">设置</h2>
+        <span class="ml-3 text-[11.5px] text-zinc-500">收信、通知与本地 AI</span>
         <button
           class="ml-auto rounded-lg p-1.5 text-zinc-500 transition hover:bg-panel-2 hover:text-zinc-300"
           @click="store.ui.settingsOpen = false"
@@ -87,6 +96,23 @@ async function save() {
       </div>
 
       <div class="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">
+        <label class="flex cursor-pointer items-start gap-3 rounded-xl border border-line bg-panel-2/60 p-3.5">
+          <input v-model="notifyNewMail" type="checkbox" class="mt-0.5 h-4 w-4 shrink-0 accent-indigo-500" />
+          <span class="min-w-0">
+            <span class="block text-[12.5px] text-zinc-300">新邮件通知</span>
+            <span class="mt-0.5 block text-[11px] leading-relaxed text-zinc-500">
+              收到新邮件时弹出系统通知。应用会为每个账号保持 IMAP 实时监听
+              （服务器支持时走 IDLE 推送），新邮件自动出现在列表里，无需手动同步；
+              关闭此项后不再弹系统通知，仅保留应用内提示。
+            </span>
+          </span>
+        </label>
+
+        <div class="flex items-center gap-3 pt-1">
+          <span class="text-[11px] font-medium tracking-wide text-zinc-500">AI · 本地 Ollama</span>
+          <span class="h-px flex-1 bg-line" />
+        </div>
+
         <label class="block">
           <span class="mb-1 block text-[12px] text-zinc-400">Ollama 服务地址</span>
           <input

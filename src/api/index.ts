@@ -7,6 +7,7 @@ import type {
   AiStatus,
   ClassifyEvent,
   DeleteReport,
+  MailSettings,
   MessageDetail,
   MessageHeader,
   SendPayload,
@@ -15,6 +16,7 @@ import type {
   Tag,
   TagGroup,
   TestReport,
+  WatchStateEvent,
 } from "./types";
 
 /** Tauri command 的前端封装。Rust 侧参数为 snake_case，此处统一用 camelCase 调用。 */
@@ -30,6 +32,12 @@ export const api = {
   // ---- 同步与读取 ----
   syncInbox: (accountId: string, folder = "INBOX", limit = 40) =>
     invoke<SyncReport>("sync_inbox", { accountId, folder, limit }),
+
+  // ---- 实时收信 ----
+  getMailSettings: () => invoke<MailSettings>("get_mail_settings"),
+  setMailSettings: (settings: MailSettings) => invoke<void>("set_mail_settings", { settings }),
+  /** 各账号监听状态快照（启动对齐用，此后靠 `mail:watch-state` 事件增量更新）。 */
+  watchStates: () => invoke<WatchStateEvent[]>("watch_states"),
   /**
    * 列邮件。传 `tagIds` 时只返回打过其中**任一**标签的邮件（OR 语义）。
    * 空数组 / null 表示不筛选。筛在 SQL 层完成，不在前端过滤。

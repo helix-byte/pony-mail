@@ -188,11 +188,29 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:11434".to_string(),
-            // 选一个体积适中、中文摘要稳定的通用模型。用户可在「AI 设置」中改；
+            // 选一个体积适中、中文摘要稳定的通用模型。用户可在「设置」中改；
             // 若本机未安装，生成摘要时会自动回退到第一个可用模型。
             model: "qwen3.5:9b".to_string(),
             auto_classify: true,
             auto_summarize: true,
+        }
+    }
+}
+
+/// 邮件行为设置。与 AI 设置分开存储（独立的 settings 键），互不影响。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSettings {
+    /// 新邮件到达时弹系统通知。缺省开启——存量 settings JSON 无此键时由 serde 默认补上，
+    /// 保证老用户升级后实时收信的通知行为与新产品预期一致。
+    #[serde(default = "default_true")]
+    pub notify_new_mail: bool,
+}
+
+impl Default for MailSettings {
+    fn default() -> Self {
+        Self {
+            notify_new_mail: true,
         }
     }
 }
@@ -257,5 +275,27 @@ mod tests {
         assert!(!s.auto_summarize, "显式关闭必须被尊重");
         let out = serde_json::to_string(&s).unwrap();
         assert!(out.contains("\"autoSummarize\":false"));
+    }
+
+    #[test]
+    fn mail_settings_default_enables_notification() {
+        assert!(MailSettings::default().notify_new_mail);
+    }
+
+    #[test]
+    fn mail_settings_legacy_json_without_notify_defaults_to_true() {
+        // 存量 settings JSON 没有 notifyNewMail 键，反序列化必须补默认开启，
+        // 否则老用户升级后实时收信会静默不弹通知。
+        let s: MailSettings = serde_json::from_str("{}").expect("空 JSON 应可反序列化");
+        assert!(s.notify_new_mail, "缺省键应默认开启新邮件通知");
+    }
+
+    #[test]
+    fn mail_settings_explicit_false_roundtrips() {
+        let raw = r#"{"notifyNewMail":false}"#;
+        let s: MailSettings = serde_json::from_str(raw).unwrap();
+        assert!(!s.notify_new_mail, "显式关闭必须被尊重");
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(out.contains("\"notifyNewMail\":false"));
     }
 }

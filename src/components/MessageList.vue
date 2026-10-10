@@ -16,6 +16,27 @@ const listScopeLabel = computed(() => {
   return "收件箱";
 });
 
+/** 实时监听状态指示（null = 不展示；stopped / 无信息时不打扰界面）。 */
+const watchHint = computed(() => {
+  const st = store.activeWatch;
+  if (!st) return null;
+  if (st.state === "online") {
+    return {
+      dot: "bg-emerald-400",
+      text: "实时收信中",
+      title: "IMAP 实时监听已连接：新邮件到达会自动出现，无需手动同步",
+    };
+  }
+  if (st.state === "reconnecting") {
+    return {
+      dot: "bg-amber-400",
+      text: "重连中",
+      title: st.detail || "IMAP 连接中断，正在自动重连；也可点右上角按钮手动同步",
+    };
+  }
+  return null;
+});
+
 /** 判断某封邮件是否已挂某个标签。 */
 function hasTag(messageId: number, tagId: number): boolean {
   return (
@@ -147,6 +168,13 @@ onBeforeUnmount(() => {
         </p>
         <p class="truncate text-[11px] text-zinc-500">
           {{ listScopeLabel }} · {{ store.messages.length }} 封
+          <template v-if="watchHint">
+            ·
+            <span class="inline-flex items-center gap-1 align-middle" :title="watchHint.title">
+              <span class="h-1.5 w-1.5 rounded-full" :class="watchHint.dot" />
+              {{ watchHint.text }}
+            </span>
+          </template>
           <template v-if="store.lastSync"> · 上次同步 {{ store.lastSync }}</template>
         </p>
       </div>
@@ -251,7 +279,7 @@ onBeforeUnmount(() => {
           <rect x="3" y="5" width="18" height="14" rx="2" />
           <path d="M3 7l9 6 9-6" stroke-linecap="round" />
         </svg>
-        {{ store.activeAccountId ? "本地还没有邮件，点击右上角同步" : "请先在左侧添加邮箱账号" }}
+        {{ store.activeAccountId ? "本地还没有邮件：实时收信会自动补齐，也可点右上角手动同步" : "请先在左侧添加邮箱账号" }}
       </div>
 
       <button

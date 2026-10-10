@@ -69,22 +69,37 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
         // https://tools.ietf.org/html/rfc2177
         //
         // The IDLE command takes no arguments.
-        self.session.run_command("IDLE")?;
-
-        // A tagged response will be sent either
         //
-        //   a) if there's an error, or
-        //   b) *after* we send DONE
-        let mut v = Vec::new();
-        self.session.readline(&mut v)?;
-        if v.starts_with(b"+") {
-            self.done = false;
-            return Ok(());
-        }
+        // 先标记 done：从发出 IDLE 起，任何失败路径都不再走 Drop 里的 DONE 收尾——
+        // 那条路径的读没有超时，对端异常时会永久阻塞；失败会话由调用方整体丢弃重连。
+        // 成功进入 IDLE 时会在下面把 done 置回 false。
+        self.done = true;
+        self.session.run_command("IDLE")?;
+        self.wait_continuation()?;
+        self.done = false;
+        Ok(())
+    }
 
-        self.session.read_response_onto(&mut v)?;
-        // We should *only* get a continuation on an error (i.e., it gives BAD or NO).
-        unreachable!();
+    /// 等待 IDLE 的续行 `+ idling`。
+    ///
+    /// 续行前可能夹带不受控的 untagged 行（如 Dovecot 的 `* OK Still here`、
+    /// 恰逢其时的新邮件通知），逐行读直到看见续行。
+    ///
+    /// 若读到 tagged 响应（如 `tag NO ...`），说明服务器拒绝了 IDLE。
+    /// 上游这里直接 `unreachable!()`——本仓库 release 构建 panic=abort，
+    /// 一旦触发会崩掉整个应用；改为返回错误，让调用方断开重连。
+    fn wait_continuation(&mut self) -> Result<()> {
+        loop {
+            let mut line = Vec::new();
+            self.session.readline(&mut line)?;
+            if line.starts_with(b"+") {
+                return Ok(());
+            }
+            if let Ok((_, imap_proto::Response::Done { .. })) = imap_proto::parse_response(&line)
+            {
+                return Err(Error::Bad("服务器拒绝 IDLE 命令".to_string()));
+            }
+        }
     }
 
     fn terminate(&mut self) -> Result<()> {
@@ -173,6 +188,22 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
         self.timed_wait(timeout, false)
     }
 
+    /// 带读超时的 DONE 收尾：退出 IDLE 并等服务器的 tagged 响应。
+    ///
+    /// 上游把这次收尾留给 `Drop`，而 `Drop` 路径的读**没有超时**——
+    /// 连接被对端静默丢弃（如网络断开）时会永久阻塞监听线程。
+    fn terminate_timed(&mut self, timeout: Duration) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        self.done = true;
+        self.session.write_line(b"DONE")?;
+        self.session.stream.get_mut().set_read_timeout(Some(timeout))?;
+        let res = self.session.read_response().map(|_| ());
+        let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
+        res
+    }
+
     fn timed_wait(mut self, timeout: Duration, reconnect: bool) -> Result<WaitOutcome> {
         self.session
             .stream
@@ -180,6 +211,8 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
             .set_read_timeout(Some(timeout))?;
         let res = self.wait_inner(reconnect);
         let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
+        // 收尾放在这里（而不是 Drop），保证 DONE 的响应读取有超时兜底。
+        self.terminate_timed(Duration::from_secs(10))?;
         res
     }
 }

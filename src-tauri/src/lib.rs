@@ -12,6 +12,9 @@ pub mod classify;
 mod commands;
 mod credentials;
 mod error;
+/// 实时收信监听（IDLE / 轮询 + 新邮件事件与系统通知）。
+/// 公开是因为 AppState 的 pub 字段引用了其事件类型。
+pub mod watcher;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
@@ -29,12 +32,17 @@ pub struct AppState {
     pub classifying: Mutex<HashSet<String>>,
     /// 各账户的整理取消标志（「停止整理」按钮在消息边界生效）。
     pub cancel_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 各账户的收信监听停止标志（账户存在期间常驻；删除账号 / 改密码时置位重启）。
+    pub watchers: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// 各账户监听状态的最新快照（`watch_states` 命令与事件广播共用一份数据）。
+    pub watch_states: Mutex<HashMap<String, watcher::WatchStateEvent>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -49,7 +57,11 @@ pub fn run() {
                 http,
                 classifying: Mutex::new(HashSet::new()),
                 cancel_flags: Mutex::new(HashMap::new()),
+                watchers: Mutex::new(HashMap::new()),
+                watch_states: Mutex::new(HashMap::new()),
             });
+            // 为已登记的每个账号拉起实时收信监听（新账号在 add_account 里即时启动）。
+            watcher::start_all(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -59,6 +71,9 @@ pub fn run() {
             commands::set_account_password,
             commands::test_connection,
             commands::sync_inbox,
+            commands::get_mail_settings,
+            commands::set_mail_settings,
+            commands::watch_states,
             commands::list_messages,
             commands::load_message_body,
             commands::set_seen,

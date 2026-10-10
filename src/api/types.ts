@@ -143,6 +143,38 @@ export interface AiSettings {
   autoSummarize: boolean;
 }
 
+/** 邮件行为设置（与 AI 设置分开存储）。 */
+export interface MailSettings {
+  /** 新邮件到达时弹系统通知（缺省视为开启）。 */
+  notifyNewMail: boolean;
+}
+
+/** 新邮件事件（`mail:new`）携带的单封摘要。 */
+export interface NewMailItem {
+  subject: string;
+  fromName: string;
+  fromAddr: string;
+}
+
+/** 实时收信：新邮件到达事件（后端 watcher 推送）。 */
+export interface NewMailEvent {
+  accountId: string;
+  folder: string;
+  /** 本轮真正新到（本地此前不存在）的邮件数。 */
+  count: number;
+  /** 最新的若干封（按 UID 倒序），供提示与通知展示。 */
+  messages: NewMailItem[];
+}
+
+/** 实时收信：监听状态（`mail:watch-state` 事件与 `watch_states` 命令共用）。 */
+export interface WatchStateEvent {
+  accountId: string;
+  /** online = 已连接；reconnecting = 退避重连中；stopped = 已停止。 */
+  state: "online" | "reconnecting" | "stopped";
+  /** 重连中时的原因（在线/停止时为空串）。 */
+  detail: string;
+}
+
 /** 批量整理的事件流（与 Rust 侧 `ClassifyEvent` 的 serde 形态一一对应）。 */
 export type ClassifyEvent =
   | { event: "start"; data: { total: number } }

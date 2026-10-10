@@ -1,4 +1,5 @@
 import { Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { defineStore } from "pinia";
 import { computed, reactive, ref } from "vue";
 
@@ -9,9 +10,11 @@ import type {
   ClassifyEvent,
   MessageDetail,
   MessageHeader,
+  NewMailEvent,
   Summary,
   Tag,
   TagGroup,
+  WatchStateEvent,
 } from "../api/types";
 import { formatDateTime } from "../utils/format";
 
@@ -85,6 +88,16 @@ export const useMailStore = defineStore("mail", () => {
   const activeTagIds = ref<number[]>([]);
   /** 被直接选中的组（用于侧栏高亮「这个组在筛选中」）。 */
   const activeGroupId = ref<number | null>(null);
+
+  // ---- 实时收信 ----
+  /**
+   * 各账号的 IMAP 监听状态（后端 `mail:watch-state` 事件与启动快照）。
+   *
+   * 缺省无键 = 状态未知（如事件尚未到达）；UI 只认 online / reconnecting。
+   */
+  const watchStates = ref<Record<string, WatchStateEvent>>({});
+  /** 当前账号的监听状态（工具条指示用；null = 无信息）。 */
+  const activeWatch = computed(() => watchStates.value[activeAccountId.value] ?? null);
 
   // ---- UI ----
   const ui = reactive({
@@ -185,7 +198,13 @@ export const useMailStore = defineStore("mail", () => {
   // 列表
   // ------------------------------------------------------------------
 
-  async function loadMessages() {
+  /**
+   * 拉取当前（账号 + 筛选）下的邮件列表。
+   *
+   * `silent` 为 true 时不进入 loading 态——实时收信的新邮件刷新用：
+   * 这类刷新是后台行为，闪一下「正在加载本地缓存…」会打断阅读。
+   */
+  async function loadMessages(silent = false) {
     if (!activeAccountId.value) {
       messages.value = [];
       return;
@@ -194,7 +213,7 @@ export const useMailStore = defineStore("mail", () => {
     // 快照筛选集合并排序成稳定 key，用于下面的竞态比对。
     const tagIds = [...activeTagIds.value].sort((a, b) => a - b);
     const filterKey = tagIds.join(",");
-    busy.messages = true;
+    if (!silent) busy.messages = true;
     try {
       const list = await api.listMessages(accountId, "INBOX", 200, 0, tagIds);
       // 竞态保护：等待期间用户可能已切账号或改了筛选，旧结果不能覆盖新结果。
@@ -204,7 +223,7 @@ export const useMailStore = defineStore("mail", () => {
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
-      busy.messages = false;
+      if (!silent) busy.messages = false;
     }
   }
 
@@ -552,13 +571,74 @@ export const useMailStore = defineStore("mail", () => {
         "ok",
       );
       await loadMessages();
-      // 同步完成后自动整理新邮件（默认开启，可在「AI 设置」中关闭）。
+      // 同步完成后自动整理新邮件（默认开启，可在「设置」中关闭）。
       if (autoClassify.value) void classifyAll();
     } catch (e) {
       toast(errorText(e), "error");
     } finally {
       busy.sync = false;
     }
+  }
+
+  // ------------------------------------------------------------------
+  // 实时收信
+  // ------------------------------------------------------------------
+
+  /** 监听事件是否已接入（initRealtime 幂等保护）。 */
+  let realtimeReady = false;
+
+  /**
+   * 接入后端实时收信事件（启动时调用一次，幂等）。
+   *
+   * - `mail:new`：新邮件到达 → 应用内提示 + 刷新当前账号列表，
+   *   并按「同步后自动整理」设置触发整理；
+   * - `mail:watch-state`：监听连接状态 → 工具条绿灯/重连提示。
+   */
+  async function initRealtime() {
+    if (realtimeReady) return;
+    realtimeReady = true;
+    try {
+      // 先取快照再挂监听：顺序颠倒会丢掉「快照读取与监听建立之间」的状态变更。
+      for (const s of await api.watchStates()) {
+        watchStates.value[s.accountId] = s;
+      }
+      await listen<WatchStateEvent>("mail:watch-state", (e) => {
+        watchStates.value[e.payload.accountId] = e.payload;
+      });
+      await listen<NewMailEvent>("mail:new", (e) => onNewMail(e.payload));
+    } catch (e) {
+      // 实时链路挂不上不影响手动同步，提示一次即可。
+      realtimeReady = false;
+      toast(errorText(e), "error");
+    }
+  }
+
+  /**
+   * 后端推送的「新邮件到达」处理：
+   * 先应用内提示（任何账号都提示），当前账号再静默刷新列表并触发自动整理。
+   */
+  function onNewMail(payload: NewMailEvent) {
+    const newest = payload.messages[0];
+    const prefix =
+      payload.accountId === activeAccountId.value
+        ? ""
+        : `【${accounts.value.find((a) => a.id === payload.accountId)?.email ?? "未知账号"}】`;
+    if (payload.count === 1 && newest) {
+      const from = newest.fromName || newest.fromAddr;
+      toast(`${prefix}新邮件：${newest.subject || "（无主题）"}（${from}）`, "ok");
+    } else {
+      toast(`${prefix}收到 ${payload.count} 封新邮件`, "ok");
+    }
+
+    // 其它账号的新邮件只提示，不打扰当前界面。
+    if (payload.accountId !== activeAccountId.value) return;
+    lastSync.value = new Date().toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    void loadMessages(true);
+    // 与手动同步一致：新邮件到达后自动整理（默认开启，可在「设置」中关闭）。
+    if (autoClassify.value) void classifyAll();
   }
 
   // ------------------------------------------------------------------
@@ -1064,6 +1144,9 @@ export const useMailStore = defineStore("mail", () => {
     toggleGroupCollapsed,
     groupsOfTag,
     sync,
+    watchStates,
+    activeWatch,
+    initRealtime,
     resetReader,
     openMessage,
     setSeen,

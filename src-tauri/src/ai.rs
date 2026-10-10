@@ -189,7 +189,7 @@ pub async fn summarize(
         .map(|payload| render_summary(&payload))
         .ok_or_else(|| {
             AppError::Other(format!(
-                "模型「{}」连续两次未能按 JSON 格式输出摘要。可尝试在「AI 设置」中更换模型后重试。",
+                "模型「{}」连续两次未能按 JSON 格式输出摘要。可尝试在「设置」中更换模型后重试。",
                 settings.model
             ))
         })
@@ -382,7 +382,7 @@ where
                 // 调用方（批量整理）会把它计入连续失败并最终熔断。
                 Err(AppError::ModelBusy(_)) => Err(AppError::Other(format!(
                     "模型「{}」连续两次陷入异常状态（重复循环或空响应）。可尝试：\
-                     ①在「AI 设置」中改选其他模型（如 qwen2.5:14b / deepseek-r1:7b）；\
+                     ①在「设置」中改选其他模型（如 qwen2.5:14b / deepseek-r1:7b）；\
                      ②重启 Ollama 服务后重试。",
                     settings.model
                 ))),
@@ -493,7 +493,7 @@ async fn first_available_model(
     models.into_iter().next().ok_or_else(|| {
         AppError::Other(format!(
             "本机没有可用的 Ollama 模型。请先执行 `ollama pull qwen3.5:9b`，\
-             或在「AI 设置」中检查服务地址（当前：{}）",
+             或在「设置」中检查服务地址（当前：{}）",
             settings.base_url
         ))
     })

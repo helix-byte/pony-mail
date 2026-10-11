@@ -60,17 +60,21 @@ img,picture,video{filter:invert(1) hue-rotate(180deg)}
 /**
  * 把清洗后的邮件正文包装为 iframe 的 srcdoc 文档。
  *
+ * `forceDark: false` 时跳过强制深色转换，按原版外观渲染（供阅读区
+ * 「查看原版外观」切换使用）；`color-scheme: only light` 防护始终保留。
+ *
  * 注入样式只兜底「邮件自身未声明」的部分，保持克制：
  * - 不设置链接颜色（交还邮件样式与浏览器默认，避免覆盖作者配色）；
  * - 表格只限制最大宽度，不改 `border-collapse`（邮件常依赖默认的
  *   separate 布局模型与 cellspacing 控制间距）。
  */
-export function buildMailSrcdoc(bodyHtml: string): string {
-  const forceDark = hasDarkMediaQuery(bodyHtml) ? "" : FORCE_DARK_CSS;
+export function buildMailSrcdoc(bodyHtml: string, opts: { forceDark?: boolean } = {}): string {
+  const { forceDark = true } = opts;
+  const darkCss = forceDark && !hasDarkMediaQuery(bodyHtml) ? FORCE_DARK_CSS : "";
   return `<!doctype html><html style="color-scheme:only light"><head><meta charset="utf-8"><meta name="color-scheme" content="only light"><base target="_blank"><style>
 :root{color-scheme:only light}
 html,body{margin:0;padding:0}
-body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.72;color:#18181b;padding:18px 22px;word-break:break-word;background:#fff}${forceDark}
+body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.72;color:#18181b;padding:18px 22px;word-break:break-word;background:#fff}${darkCss}
 img{max-width:100%;height:auto}
 table{max-width:100%}
 pre{white-space:pre-wrap;font-family:inherit}

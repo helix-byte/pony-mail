@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 
 import { useMailStore } from "../stores/mail";
 import { avatarColor, avatarText, formatDate, tagDotStyle } from "../utils/format";
@@ -61,18 +61,56 @@ const menu = reactive({
   tagPanelOpen: false,
 });
 
-/** 打开右键菜单：把光标位置夹回视口内，避免菜单溢出屏幕。 */
+/** 菜单根部元素，用于按真实渲染高度重新定位。 */
+const menuEl = ref<HTMLElement | null>(null);
+/** 最近一次右键的视口坐标：重新定位时始终以它为锚点。 */
+const anchor = { x: 0, y: 0 };
+/** 菜单与视口边缘需要保留的安全边距（px）。 */
+const MENU_MARGIN = 8;
+
+/**
+ * 以右键锚点放置菜单：水平超出右缘时向左收回；垂直优先贴光标下方，
+ * 下方放不下翻到光标上方，上下都放不下则贴住下缘（由根部限高滚动兜底）。
+ */
+function placeMenuAt(h: number, w: number) {
+  let x = anchor.x;
+  if (x + w + MENU_MARGIN > window.innerWidth) {
+    x = Math.max(MENU_MARGIN, window.innerWidth - w - MENU_MARGIN);
+  }
+  let y = anchor.y;
+  if (y + h + MENU_MARGIN > window.innerHeight) {
+    const above = anchor.y - h;
+    y = above >= MENU_MARGIN ? above : Math.max(MENU_MARGIN, window.innerHeight - h - MENU_MARGIN);
+  }
+  menu.x = x;
+  menu.y = y;
+}
+
+/** 按菜单真实渲染高度重新定位。展开/收起标签面板后必须调用，否则底部操作项会被推出视口。 */
+function placeMenu() {
+  const el = menuEl.value;
+  if (!el) return;
+  placeMenuAt(el.offsetHeight, el.offsetWidth);
+}
+
+/** 打开右键菜单：先用基础高度粗定位避免闪出屏幕，渲染后再按真实高度校准。 */
 function openMenu(e: MouseEvent, id: number) {
   e.preventDefault();
   menu.messageId = id;
   menu.tagPanelOpen = false;
-  // 菜单最宽 176（标签面板展开后仍是这个宽度，只是变高），
-  // 高度上限按标签面板展开后的情形保守估计，直接按最大高度夹一次即可。
-  const w = 176;
-  const h = 300;
-  menu.x = Math.min(Math.max(e.clientX, 8), Math.max(8, window.innerWidth - w - 8));
-  menu.y = Math.min(Math.max(e.clientY, 8), Math.max(8, window.innerHeight - h - 8));
+  anchor.x = e.clientX;
+  anchor.y = e.clientY;
+  // 首帧拿不到 DOM，无法测量真实高度：按面板收起时的基础高度（约 220px）粗定位即可，
+  // 渲染后的 placeMenu 会按真实高度校准。此处不能按面板展开的极限高度估计，否则菜单靠近底部时会被不必要地顶高。
+  placeMenuAt(220, 176);
   menu.visible = true;
+  void nextTick(placeMenu);
+}
+
+/** 展开/收起标签打标面板。菜单高度随之大幅变化，需在渲染后重新定位。 */
+function onToggleTagPanel() {
+  menu.tagPanelOpen = !menu.tagPanelOpen;
+  void nextTick(placeMenu);
 }
 
 function closeMenu() {
@@ -373,7 +411,8 @@ onBeforeUnmount(() => {
     <Teleport to="body">
       <div
         v-if="menu.visible"
-        class="fixed z-50 w-44 overflow-hidden rounded-lg border border-line bg-panel py-1 shadow-2xl shadow-black/50"
+        ref="menuEl"
+        class="fixed z-50 max-h-[calc(100vh-16px)] w-44 overflow-y-auto rounded-lg border border-line bg-panel py-1 shadow-2xl shadow-black/50"
         :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
         @click.stop
         @contextmenu.stop.prevent
@@ -421,7 +460,7 @@ onBeforeUnmount(() => {
         <!-- 标签：展开一个可连续勾选的子面板 -->
         <button
           class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-zinc-300 transition hover:bg-hover"
-          @click="menu.tagPanelOpen = !menu.tagPanelOpen"
+          @click="onToggleTagPanel"
         >
           <svg class="h-3.5 w-3.5 shrink-0 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
             <path d="M3 11V5a2 2 0 0 1 2-2h6l10 10-8 8L3 11z" stroke-linejoin="round" />

@@ -4,6 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { useMailStore } from "../stores/mail";
 import { avatarColor, avatarText, formatDateTime, formatSize } from "../utils/format";
+import { buildMailSrcdoc } from "../utils/mailHtml";
 
 const store = useMailStore();
 
@@ -15,20 +16,13 @@ const detail = computed(() => store.detail);
 /**
  * 邮件正文用 sandbox iframe 渲染：
  * 不授予 allow-scripts，即使清洗层漏掉脚本也无法执行，也就拿不到 Tauri 能力。
+ * 文档构造（含深色模式防护）见 utils/mailHtml.ts 的 buildMailSrcdoc。
  */
 const srcdoc = computed(() => {
   const d = store.detail;
   if (!d) return "";
   const body = d.bodyHtml?.trim() ? d.bodyHtml : "<p style='color:#71717a'>（这封邮件没有可显示的正文）</p>";
-  return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>
-html,body{margin:0;padding:0}
-body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.72;color:#18181b;padding:18px 22px;word-break:break-word;background:#fff}
-img{max-width:100%;height:auto}
-table{max-width:100%;border-collapse:collapse}
-a{color:#4f46e5}
-pre{white-space:pre-wrap;font-family:inherit}
-blockquote{border-left:3px solid #e4e4e7;margin:8px 0;padding-left:12px;color:#52525b}
-</style></head><body>${body}</body></html>`;
+  return buildMailSrcdoc(body);
 });
 
 function measure() {

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { useMailStore } from "../stores/mail";
 import { avatarColor, avatarText, formatDateTime, formatSize } from "../utils/format";
+import { buildMailSrcdoc, hasDarkMediaQuery } from "../utils/mailHtml";
 
 const store = useMailStore();
 
@@ -12,23 +13,38 @@ const frameHeight = ref(0);
 
 const detail = computed(() => store.detail);
 
+/** 系统深色偏好（响应中途切换）。 */
+const darkPref = window.matchMedia("(prefers-color-scheme: dark)");
+const isDarkPref = ref(darkPref.matches);
+const onDarkPrefChange = (e: MediaQueryListEvent) => {
+  isDarkPref.value = e.matches;
+};
+
+/** 当前邮件是否处于强制深色转换状态：深色偏好且邮件无自带深色适配。 */
+const forceDarkActive = computed(
+  () => isDarkPref.value && !!store.detail && !hasDarkMediaQuery(store.detail.bodyHtml ?? ""),
+);
+
+/** 阅读区「查看原版外观」：为 true 时绕过强制深色转换，按原版渲染。 */
+const showOriginal = ref(false);
+// 切换到另一封邮件时回到默认（深色适配）渲染。
+watch(
+  () => store.detail,
+  () => {
+    showOriginal.value = false;
+  },
+);
+
 /**
  * 邮件正文用 sandbox iframe 渲染：
  * 不授予 allow-scripts，即使清洗层漏掉脚本也无法执行，也就拿不到 Tauri 能力。
+ * 文档构造（含深色模式防护）见 utils/mailHtml.ts 的 buildMailSrcdoc。
  */
 const srcdoc = computed(() => {
   const d = store.detail;
   if (!d) return "";
   const body = d.bodyHtml?.trim() ? d.bodyHtml : "<p style='color:#71717a'>（这封邮件没有可显示的正文）</p>";
-  return `<!doctype html><html><head><meta charset="utf-8"><base target="_blank"><style>
-html,body{margin:0;padding:0}
-body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.72;color:#18181b;padding:18px 22px;word-break:break-word;background:#fff}
-img{max-width:100%;height:auto}
-table{max-width:100%;border-collapse:collapse}
-a{color:#4f46e5}
-pre{white-space:pre-wrap;font-family:inherit}
-blockquote{border-left:3px solid #e4e4e7;margin:8px 0;padding-left:12px;color:#52525b}
-</style></head><body>${body}</body></html>`;
+  return buildMailSrcdoc(body, { forceDark: !showOriginal.value });
 });
 
 function measure() {
@@ -63,12 +79,104 @@ function bindFrameLinks() {
     e.preventDefault();
     void openUrl(href).catch(() => store.toast("打开链接失败，请检查系统默认应用", "error"));
   });
+  // iframe 内的右键事件不会冒泡到父页面，需在帧文档上单独接管。
+  doc.addEventListener("contextmenu", onFrameContextMenu);
 }
 
 function onFrameLoad() {
   bindFrameLinks();
   measure();
 }
+
+// ------------------------------------------------------------------
+// 正文区右键菜单：「查看原版外观」/「恢复深色显示」
+// ------------------------------------------------------------------
+
+/**
+ * 仅在邮件正被强制深色转换时接管右键并弹出菜单（浅色偏好或邮件
+ * 自带深色适配时无内容可切换，右键保持原样不弹菜单）。
+ */
+const menu = reactive({ visible: false, x: 0, y: 0 });
+const menuEl = ref<HTMLElement | null>(null);
+/** 最近一次右键的视口坐标：重新定位时始终以它为锚点。 */
+const menuAnchor = { x: 0, y: 0 };
+/** 菜单与视口边缘需要保留的安全边距（px）。 */
+const MENU_MARGIN = 8;
+
+/** 以右键锚点放置菜单：水平超出右缘时向左收回；垂直放不下时翻到光标上方。 */
+function placeMenuAt(h: number, w: number) {
+  let x = menuAnchor.x;
+  if (x + w + MENU_MARGIN > window.innerWidth) {
+    x = Math.max(MENU_MARGIN, window.innerWidth - w - MENU_MARGIN);
+  }
+  let y = menuAnchor.y;
+  if (y + h + MENU_MARGIN > window.innerHeight) {
+    const above = menuAnchor.y - h;
+    y = above >= MENU_MARGIN ? above : Math.max(MENU_MARGIN, window.innerHeight - h - MENU_MARGIN);
+  }
+  menu.x = x;
+  menu.y = y;
+}
+
+/** 按菜单真实渲染高度校准位置（打开时先按估算高度粗定位）。 */
+function placeMenu() {
+  const el = menuEl.value;
+  if (!el) return;
+  placeMenuAt(el.offsetHeight, el.offsetWidth);
+}
+
+function openMenuAt(x: number, y: number) {
+  menuAnchor.x = x;
+  menuAnchor.y = y;
+  // 单项菜单的基础高度约 40px、宽度对应 w-44；渲染后 placeMenu 再按真实值校准。
+  placeMenuAt(40, 176);
+  menu.visible = true;
+  void nextTick(placeMenu);
+}
+
+function closeMenu() {
+  menu.visible = false;
+}
+
+/** 正文区（含空白处）右键。 */
+function onPaneContextMenu(e: MouseEvent) {
+  if (!forceDarkActive.value) return;
+  e.preventDefault();
+  openMenuAt(e.clientX, e.clientY);
+}
+
+/** iframe 文档（邮件内容）内右键：帧内坐标换算到父页面视口。 */
+function onFrameContextMenu(e: MouseEvent) {
+  if (!forceDarkActive.value) return;
+  e.preventDefault();
+  const rect = iframeRef.value?.getBoundingClientRect();
+  if (!rect) return;
+  openMenuAt(rect.left + e.clientX, rect.top + e.clientY);
+}
+
+function onToggleOriginal() {
+  showOriginal.value = !showOriginal.value;
+  closeMenu();
+}
+
+function onMenuKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape") closeMenu();
+}
+
+onMounted(() => {
+  darkPref.addEventListener("change", onDarkPrefChange);
+  // 点击 / 缩放 / Esc 都应关闭菜单；菜单内部按钮的 click 经 @click.stop 不外泄。
+  window.addEventListener("click", closeMenu);
+  window.addEventListener("resize", closeMenu);
+  window.addEventListener("keydown", onMenuKeydown);
+});
+
+onBeforeUnmount(() => {
+  darkPref.removeEventListener("change", onDarkPrefChange);
+  window.removeEventListener("click", closeMenu);
+  window.removeEventListener("resize", closeMenu);
+  window.removeEventListener("keydown", onMenuKeydown);
+});
 
 watch(srcdoc, () => {
   frameHeight.value = 0;
@@ -190,7 +298,7 @@ function shortAddr(list: string): string {
       </header>
 
       <!-- 正文滚动区 -->
-      <div class="min-h-0 flex-1 overflow-y-auto">
+      <div class="min-h-0 flex-1 overflow-y-auto" @scroll="closeMenu">
         <!-- AI 摘要 -->
         <div class="px-6 pt-4">
           <div
@@ -269,7 +377,7 @@ function shortAddr(list: string): string {
         </div>
 
         <!-- 正文 -->
-        <div class="p-6">
+        <div class="p-6" @contextmenu="onPaneContextMenu">
           <iframe
             ref="iframeRef"
             class="mail-frame"
@@ -281,5 +389,28 @@ function shortAddr(list: string): string {
         </div>
       </div>
     </template>
+
+    <!-- 正文区右键菜单：仅在强制深色转换可切换时弹出 -->
+    <Teleport to="body">
+      <div
+        v-if="menu.visible"
+        ref="menuEl"
+        class="fixed z-50 w-44 rounded-lg border border-line bg-panel py-1 shadow-2xl shadow-black/50"
+        :style="{ left: `${menu.x}px`, top: `${menu.y}px` }"
+        @click.stop
+        @contextmenu.stop.prevent
+      >
+        <button
+          class="flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-[12.5px] text-zinc-300 transition hover:bg-hover"
+          @click="onToggleOriginal"
+        >
+          <svg class="h-3.5 w-3.5 shrink-0 text-zinc-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none" />
+          </svg>
+          {{ showOriginal ? "恢复深色显示" : "查看原版外观" }}
+        </button>
+      </div>
+    </Teleport>
   </section>
 </template>

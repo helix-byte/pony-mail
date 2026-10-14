@@ -19,6 +19,7 @@ import type {
   WatchStateEvent,
 } from "../api/types";
 import { formatDateTime } from "../utils/format";
+import { isGmailHost } from "../utils/provider";
 
 export type ToastKind = "info" | "ok" | "error";
 
@@ -886,7 +887,8 @@ export const useMailStore = defineStore("mail", () => {
       void loadTags();
       void loadGroups();
       if (report.deletedRemote) {
-        toast("邮件已删除", "ok");
+        // Gmail 的删除实际是「移入回收站」，提示文案如实说明，避免用户以为已彻底删除。
+        toast(isGmailHost(activeAccount.value?.imapHost) ? "邮件已移入 Gmail 回收站" : "邮件已删除", "ok");
       } else {
         toast(
           `已在本地删除，但服务器删除失败：${report.remoteError || "原因未知"}`,
@@ -914,7 +916,10 @@ export const useMailStore = defineStore("mail", () => {
       void loadTags();
       void loadGroups();
       if (report.deletedRemote) {
-        toast(`已删除 ${report.deletedLocal} 封邮件`, "ok");
+        const deletedText = isGmailHost(activeAccount.value?.imapHost)
+          ? `已将 ${report.deletedLocal} 封邮件移入 Gmail 回收站`
+          : `已删除 ${report.deletedLocal} 封邮件`;
+        toast(deletedText, "ok");
       } else {
         toast(
           `已在本地删除 ${report.deletedLocal} 封，但服务器删除失败：${report.remoteError || "原因未知"}`,

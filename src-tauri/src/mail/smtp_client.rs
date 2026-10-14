@@ -52,7 +52,9 @@ pub fn send(account: &Account, password: &str, payload: &SendPayload) -> AppResu
 
 /// 依据账号配置构建 SMTP 传输通道（发送与连通性测试复用）。
 pub fn build_transport(account: &Account, password: &str) -> AppResult<SmtpTransport> {
-    let credentials = Credentials::new(account.username.clone(), password.to_string());
+    // 与 IMAP 登录同一套凭据规范化（Gmail 应用专用密码去掉粘贴带入的空白）。
+    let password = super::normalize_password(account, password);
+    let credentials = Credentials::new(account.username.clone(), password);
 
     if !account.smtp_tls {
         return Ok(SmtpTransport::builder_dangerous(&account.smtp_host)

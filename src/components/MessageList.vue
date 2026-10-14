@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "v
 
 import { useMailStore } from "../stores/mail";
 import { avatarColor, avatarText, formatDate, tagDotStyle } from "../utils/format";
+import { isGmailHost } from "../utils/provider";
 
 const store = useMailStore();
 
@@ -151,11 +152,12 @@ function onDelete() {
   const id = menu.messageId;
   closeMenu();
   if (id === null) return;
-  if (
-    confirm(
-      "确定要永久删除这封邮件吗？\n该操作会在服务器上同步删除，且无法撤销。",
-    )
-  ) {
+  // Gmail 账号的删除是「移入回收站」（可恢复），确认文案必须如实说明，
+  // 与后端 imap_client::delete_or_trash 对 Gmail 的分流保持一致。
+  const text = isGmailHost(store.activeAccount?.imapHost)
+    ? "确定要删除这封邮件吗？\n邮件将移入 Gmail 的「回收站」，30 天内可恢复。"
+    : "确定要永久删除这封邮件吗？\n该操作会在服务器上同步删除，且无法撤销。";
+  if (confirm(text)) {
     void store.deleteMessage(id);
   }
 }

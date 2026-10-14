@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { api, errorText } from "../api";
 import type { AccountInput } from "../api/types";
 import { useMailStore } from "../stores/mail";
+import { isGmailHost } from "../utils/provider";
 
 const store = useMailStore();
 
@@ -33,6 +35,7 @@ const presets: Record<string, { imap: string; smtp: string }> = {
   "163.com": { imap: "imap.163.com", smtp: "smtp.163.com" },
   "126.com": { imap: "imap.126.com", smtp: "smtp.126.com" },
   "gmail.com": { imap: "imap.gmail.com", smtp: "smtp.gmail.com" },
+  "googlemail.com": { imap: "imap.gmail.com", smtp: "smtp.gmail.com" },
   "outlook.com": { imap: "outlook.office365.com", smtp: "smtp.office365.com" },
   "hotmail.com": { imap: "outlook.office365.com", smtp: "smtp.office365.com" },
   "foxmail.com": { imap: "imap.qq.com", smtp: "smtp.qq.com" },
@@ -48,6 +51,18 @@ function applyPreset() {
   form.smtpHost = hit.smtp;
   form.smtpPort = 465;
   if (!form.username) form.username = form.email;
+}
+
+/** 服务器地址和邮箱域名任一指向 Gmail 都按 Gmail 引导（Workspace 自定义域名靠主机识别）。 */
+const isGmail = computed(() => {
+  const domain = form.email.split("@")[1]?.trim().toLowerCase() ?? "";
+  return isGmailHost(form.imapHost) || domain === "gmail.com" || domain === "googlemail.com";
+});
+
+function openAppPasswordPage() {
+  void openUrl("https://myaccount.google.com/apppasswords").catch(() =>
+    store.toast("打开链接失败，请检查系统默认应用", "error"),
+  );
 }
 
 const canSubmit = computed(
@@ -155,12 +170,34 @@ async function save() {
               v-model="form.password"
               type="password"
               class="w-full rounded-lg border border-line bg-panel-2 px-3 py-2 text-[13px] text-zinc-200 outline-none transition focus:border-accent/60"
-              placeholder="QQ/163 等需使用 IMAP 授权码，不是登录密码"
+              :placeholder="
+                isGmail
+                  ? '粘贴 16 位应用专用密码（可带空格）'
+                  : 'QQ/163 等需使用 IMAP 授权码，不是登录密码'
+              "
             />
             <span class="mt-1 block text-[11px] text-zinc-600">
               密码保存在 Windows 凭据管理器，不会写入本地数据库。
             </span>
           </label>
+
+          <div
+            v-if="isGmail"
+            class="col-span-2 rounded-xl border border-line bg-panel-2/60 p-3.5 text-[12px]"
+          >
+            <p class="mb-1 font-medium text-zinc-300">Gmail 需要「应用专用密码」</p>
+            <p class="leading-relaxed text-zinc-500">
+              Gmail 不再支持用账号密码登录第三方客户端。请先在 Google 账号开启两步验证，
+              然后生成 16 位应用专用密码粘贴到上方（带空格粘贴也没关系，会自动去掉）。
+              若网络无法直连 Google 服务器，请先开启代理。
+            </p>
+            <button
+              class="mt-2 text-[12px] text-indigo-300 transition hover:text-indigo-200"
+              @click="openAppPasswordPage"
+            >
+              打开 Google 应用专用密码页面 ↗
+            </button>
+          </div>
         </div>
 
         <div class="rounded-xl border border-line bg-panel-2/60 p-3.5">

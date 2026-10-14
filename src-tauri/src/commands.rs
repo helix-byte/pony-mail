@@ -92,15 +92,23 @@ pub async fn test_connection(input: AccountInput) -> AppResult<TestReport> {
             smtp_message: String::new(),
         };
 
+        // Gmail 失败时追加定向提示：认证方式与网络可达性是最常见的两个坑
+        // （普通密码必败；大陆网络常无法直连 imap/smtp.gmail.com）。
+        let gmail_hint = if account.is_gmail() {
+            "；若为 Gmail：登录必须使用 16 位应用专用密码（先在 Google 账号开启两步验证后生成），普通登录密码无效；网络无法直连 Google 时请先开启代理"
+        } else {
+            ""
+        };
+
         match imap_client::connect(&account, &input.password) {
             Ok(mut session) => match imap_client::list_uids(&mut session, "INBOX") {
                 Ok(uids) => {
                     report.imap_ok = true;
                     report.imap_message = format!("IMAP 登录成功，收件箱共 {} 封邮件", uids.len());
                 }
-                Err(e) => report.imap_message = format!("IMAP 打开文件夹失败：{e}"),
+                Err(e) => report.imap_message = format!("IMAP 打开文件夹失败：{e}{gmail_hint}"),
             },
-            Err(e) => report.imap_message = format!("IMAP 登录失败：{e}"),
+            Err(e) => report.imap_message = format!("IMAP 登录失败：{e}{gmail_hint}"),
         }
 
         match smtp_client::build_transport(&account, &input.password) {
@@ -109,10 +117,12 @@ pub async fn test_connection(input: AccountInput) -> AppResult<TestReport> {
                     report.smtp_ok = true;
                     report.smtp_message = "SMTP 连接与认证成功".to_string();
                 }
-                Ok(false) => report.smtp_message = "SMTP 已连接但认证被拒绝".to_string(),
-                Err(e) => report.smtp_message = e.to_string(),
+                Ok(false) => {
+                    report.smtp_message = format!("SMTP 已连接但认证被拒绝{gmail_hint}")
+                }
+                Err(e) => report.smtp_message = format!("{e}{gmail_hint}"),
             },
-            Err(e) => report.smtp_message = e.to_string(),
+            Err(e) => report.smtp_message = format!("{e}{gmail_hint}"),
         }
 
         Ok(report)
@@ -496,7 +506,7 @@ pub async fn delete_message(
         match imap_client::connect(&account, &password) {
             Ok(mut session) => {
                 let result = imap_client::select_folder(&mut session, &folder)
-                    .and_then(|_| imap_client::delete_messages(&mut session, &[uid]));
+                    .and_then(|_| imap_client::delete_or_trash(&mut session, &account, &folder, &[uid]));
                 imap_client::logout(session);
                 result.err().map(|e| e.to_string())
             }
@@ -560,7 +570,7 @@ pub async fn delete_messages(
             match imap_client::connect(&account, &password) {
                 Ok(mut session) => {
                     let result = imap_client::select_folder(&mut session, folder)
-                        .and_then(|_| imap_client::delete_messages(&mut session, uids));
+                        .and_then(|_| imap_client::delete_or_trash(&mut session, &account, folder, uids));
                     imap_client::logout(session);
                     if let Err(e) = result {
                         first_err.get_or_insert(e.to_string());

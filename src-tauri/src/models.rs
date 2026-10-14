@@ -21,6 +21,25 @@ pub struct Account {
     pub created_at: String,
 }
 
+impl Account {
+    /// 是否为 Gmail / Google 系账号（按 IMAP 主机判定：imap.gmail.com / imap.googlemail.com，
+    /// Google Workspace 自建域名也走同一台服务器）。
+    ///
+    /// Gmail 的 IMAP 语义与通用服务器不同，需要区别对待的至少有三处：
+    /// 登录用「应用专用密码」而不是账号密码；删除邮件应「移入回收站」而不是
+    /// 打 `\Deleted` 后 `EXPUNGE`（后者在 Gmail 上等于绕过回收站）；应用专用密码
+    /// 常被以 “xxxx xxxx xxxx xxxx” 形式粘贴，登录前需去掉空白。
+    pub fn is_gmail(&self) -> bool {
+        let host = self.imap_host.trim().to_ascii_lowercase();
+        // 注意域名标签边界：直接用 ends_with("gmail.com") 会把 mygmail.com 也判进来，
+        // 必须要求 gmail.com 前面隔着 '.' 或整串相等。
+        host == "gmail.com"
+            || host == "googlemail.com"
+            || host.ends_with(".gmail.com")
+            || host.ends_with(".googlemail.com")
+    }
+}
+
 /// 新增账号 / 测试连接入参（含明文密码，仅内存传递，不落库）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -288,6 +307,43 @@ pub struct ParsedMail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account_with_imap_host(host: &str) -> Account {
+        Account {
+            id: "t".into(),
+            email: "t@example.com".into(),
+            display_name: String::new(),
+            imap_host: host.into(),
+            imap_port: 993,
+            imap_tls: true,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_tls: true,
+            username: String::new(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn is_gmail_matches_gmail_and_googlemail_hosts() {
+        for host in [
+            "imap.gmail.com",
+            "IMAP.GMAIL.COM",
+            " imap.gmail.com ",
+            "imap.googlemail.com",
+            "gmail.com",
+        ] {
+            assert!(account_with_imap_host(host).is_gmail(), "{host} 应判定为 Gmail");
+        }
+    }
+
+    #[test]
+    fn is_gmail_rejects_lookalike_hosts() {
+        // 只认域名整体后缀，避免把自建/第三方里带 "gmail" 字样的主机误判。
+        for host in ["mygmail.com", "gmail.qq.com", "imap.example.com", ""] {
+            assert!(!account_with_imap_host(host).is_gmail(), "{host} 不应判定为 Gmail");
+        }
+    }
 
     #[test]
     fn ai_settings_default_enables_both_auto_switches() {
